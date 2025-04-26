@@ -16,13 +16,27 @@ echo "Instalando dependências..."
 apt-get update
 apt-get install -y git golang-go
 
-# Parar o serviço se estiver em execução
-echo "Parando serviço atual se estiver em execução..."
-systemctl stop mtm-agent.service || true
-
-# Remover diretório anterior completamente
-echo "Removendo instalação anterior..."
-rm -rf /opt/mtm_agent
+# VERIFICAÇÃO: O projeto já existe?
+if [ -d "/opt/mtm_agent" ] || [ -f "/etc/systemd/system/mtm-agent.service" ]; then
+    echo "Instalação existente detectada. Removendo..."
+    
+    # Parar o serviço se estiver em execução
+    echo "Parando serviço..."
+    systemctl stop mtm-agent.service || true
+    
+    # Desabilitar o serviço
+    echo "Desabilitando serviço..."
+    systemctl disable mtm-agent.service || true
+    
+    # Remover arquivo de serviço
+    echo "Removendo arquivo de serviço..."
+    rm -f /etc/systemd/system/mtm-agent.service
+    systemctl daemon-reload
+    
+    # Remover diretório de instalação
+    echo "Removendo diretório de instalação..."
+    rm -rf /opt/mtm_agent
+fi
 
 # Criar novo diretório de instalação
 echo "Criando diretório de instalação..."
