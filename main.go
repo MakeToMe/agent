@@ -193,8 +193,10 @@ func getFailedLogins() ([]LoginFailure, error) {
 	// 2. grep: extrai apenas os IPs
 	// 3. sort e uniq -c: conta ocorrências únicas
 	// 4. sort -nr: ordena por número de ocorrências (maior para menor)
+	// Removemos qualquer limite no comando shell para obter todos os IPs possíveis
 	cmd := exec.Command("bash", "-c", 
 		"lastb -i | grep -o -E '\\b([0-9]{1,3}\\.){3}[0-9]{1,3}\\b' | sort | uniq -c | sort -nr")
+	fmt.Println("Executando comando para obter falhas de login...")
 	output, err := cmd.CombinedOutput()
 
 	if err != nil {
@@ -260,8 +262,18 @@ func sendBannedIPsList(localIP string, failedLogins []LoginFailure) {
 		BanList: bannedIPs,
 	}
 
-	// Log para depuração
-	fmt.Printf("Enviando %d IPs suspeitos para API\n", len(bannedIPs))
+	// Log para depuração detalhado
+	fmt.Printf("Encontrados %d IPs com 3 ou mais falhas de login\n", len(bannedIPs))
+	fmt.Printf("Enviando %d IPs suspeitos para API (limite configurado: 1000)\n", len(bannedIPs))
+	
+	// Imprimir os primeiros 5 IPs para depuração
+	fmt.Println("Primeiros IPs da lista (até 5):")
+	for i, ip := range bannedIPs {
+		if i >= 5 {
+			break
+		}
+		fmt.Printf("  - %s\n", ip.IP2Ban)
+	}
 
 	jsonData, err := json.Marshal(payload)
 	if err != nil {
