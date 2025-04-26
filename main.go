@@ -233,9 +233,9 @@ func getFailedLogins() ([]LoginFailure, error) {
 		return failures[i].Count > failures[j].Count
 	})
 
-	// Limitar aos top 100 IPs com mais falhas
-	if len(failures) > 100 {
-		failures = failures[:100]
+	// Limitar aos top 1000 IPs com mais falhas
+	if len(failures) > 1000 {
+		failures = failures[:1000]
 	}
 
 	return failures, nil
