@@ -29,6 +29,9 @@ type LoginFailure struct {
 	Count int
 }
 
+// Variável global para controlar se é o primeiro ciclo
+var isFirstCycle = true
+
 func main() {
 	// Obter IP da VM
 	ip, err := getLocalIP()
@@ -43,16 +46,22 @@ func main() {
 	// Iniciar rotina para executar lastb e enviar lista de IPs banidos a cada 5 minutos
 	ticker := time.NewTicker(5 * time.Minute)
 	go func() {
-		// Executar imediatamente na primeira execução
-		failedLogins, err := getFailedLogins()
+		// Executar imediatamente na primeira execução - obter todos os IPs históricos
+		fmt.Println("Primeiro ciclo: obtendo todos os IPs históricos...")
+		failedLogins, err := getFailedLogins(true) // true = primeiro ciclo
 		if err != nil {
 			log.Printf("Erro ao obter logins falhos: %v\n", err)
 		} else {
 			sendBannedIPsList(ip, failedLogins)
 		}
 		
+		// Marcar que o primeiro ciclo foi concluído
+		isFirstCycle = false
+		fmt.Println("Primeiro ciclo concluído. Próximos ciclos usarão filtro de tempo.")
+		
 		for range ticker.C {
-			failedLogins, err := getFailedLogins()
+			fmt.Println("Ciclo subsequente: obtendo apenas IPs recentes...")
+			failedLogins, err := getFailedLogins(false) // false = ciclos subsequentes
 			if err != nil {
 				log.Printf("Erro ao obter logins falhos: %v\n", err)
 				continue
@@ -187,16 +196,27 @@ func startHTTPServer() {
 }
 
 // getFailedLogins obtém a lista de falhas de login do sistema usando lastb e agrega por IP
-func getFailedLogins() ([]LoginFailure, error) {
-	// Comando shell completo para extrair IPs com 3 ou mais tentativas falhas
-	// 1. lastb -i: lista tentativas falhas com IPs
-	// 2. grep: extrai apenas os IPs
-	// 3. sort e uniq -c: conta ocorrências únicas
-	// 4. sort -nr: ordena por número de ocorrências (maior para menor)
-	// Removemos qualquer limite no comando shell para obter todos os IPs possíveis
-	cmd := exec.Command("bash", "-c", 
-		"lastb -i | grep -o -E '\\b([0-9]{1,3}\\.){3}[0-9]{1,3}\\b' | sort | uniq -c | sort -nr")
-	fmt.Println("Executando comando para obter falhas de login...")
+func getFailedLogins(isFirstRun bool) ([]LoginFailure, error) {
+	var cmd *exec.Cmd
+	
+	if isFirstRun {
+		// Primeiro ciclo: obter todos os IPs históricos
+		// 1. lastb -i: lista tentativas falhas com IPs
+		// 2. grep: extrai apenas os IPs
+		// 3. sort e uniq -c: conta ocorrências únicas
+		// 4. sort -nr: ordena por número de ocorrências (maior para menor)
+		fmt.Println("Executando comando para obter TODAS as falhas de login históricas...")
+		cmd = exec.Command("bash", "-c", 
+			"lastb -i | grep -o -E '\\b([0-9]{1,3}\\.){3}[0-9]{1,3}\\b' | sort | uniq -c | sort -nr")
+	} else {
+		// Ciclos subsequentes: obter apenas IPs dos últimos 8 minutos
+		// Usamos o comando date para obter a data/hora de 8 minutos atrás no formato que o lastb aceita
+		fmt.Println("Executando comando para obter falhas de login dos últimos 8 minutos...")
+		cmd = exec.Command("bash", "-c", 
+			"TIMEFILTER=$(date --date='8 minutes ago' '+%Y%m%d%H%M%S') && " +
+			"lastb -i -t $TIMEFILTER | grep -o -E '\\b([0-9]{1,3}\\.){3}[0-9]{1,3}\\b' | sort | uniq -c | sort -nr")
+	}
+	
 	output, err := cmd.CombinedOutput()
 
 	if err != nil {
@@ -235,9 +255,9 @@ func getFailedLogins() ([]LoginFailure, error) {
 		return failures[i].Count > failures[j].Count
 	})
 
-	// Limitar aos top 1000 IPs com mais falhas
-	if len(failures) > 1000 {
-		failures = failures[:1000]
+	// Limitar aos top 5000 IPs com mais falhas
+	if len(failures) > 5000 {
+		failures = failures[:5000]
 	}
 
 	return failures, nil
@@ -264,7 +284,8 @@ func sendBannedIPsList(localIP string, failedLogins []LoginFailure) {
 
 	// Log para depuração detalhado
 	fmt.Printf("Encontrados %d IPs com 3 ou mais falhas de login\n", len(bannedIPs))
-	fmt.Printf("Enviando %d IPs suspeitos para API (limite configurado: 1000)\n", len(bannedIPs))
+	fmt.Printf("Enviando %d IPs suspeitos para API (limite configurado: 5000)\n", len(bannedIPs))
+	fmt.Printf("Ciclo: %s\n", map[bool]string{true: "PRIMEIRO - todos os IPs históricos", false: "SUBSEQUENTE - apenas IPs recentes"}[isFirstCycle])
 	
 	// Imprimir os primeiros 5 IPs para depuração
 	fmt.Println("Primeiros IPs da lista (até 5):")
