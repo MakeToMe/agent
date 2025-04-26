@@ -16,14 +16,15 @@ echo "Instalando dependências..."
 apt-get update
 apt-get install -y git golang-go
 
-# Limpar instalação anterior se existir
-echo "Limpando instalação anterior..."
-if [ -d "/opt/mtm_agent" ]; then
-    systemctl stop mtm-agent.service || true
-    rm -rf /opt/mtm_agent/*
-fi
+# Parar o serviço se estiver em execução
+echo "Parando serviço atual se estiver em execução..."
+systemctl stop mtm-agent.service || true
 
-# Criar diretório de instalação
+# Remover diretório anterior completamente
+echo "Removendo instalação anterior..."
+rm -rf /opt/mtm_agent
+
+# Criar novo diretório de instalação
 echo "Criando diretório de instalação..."
 mkdir -p /opt/mtm_agent
 cd /opt/mtm_agent
@@ -41,12 +42,17 @@ echo "Compilando o código..."
 go mod tidy
 go build -o mtm_agent
 
-# Configurar o serviço systemd
+# Verificar se o arquivo de serviço existe
 echo "Configurando serviço systemd..."
-cp mtm-agent.service /etc/systemd/system/
-systemctl daemon-reload
-systemctl enable mtm-agent.service
-systemctl start mtm-agent.service
+if [ -f "mtm-agent.service" ]; then
+    cp mtm-agent.service /etc/systemd/system/
+    systemctl daemon-reload
+    systemctl enable mtm-agent.service
+    systemctl start mtm-agent.service
+else
+    echo "ERRO: Arquivo mtm-agent.service não encontrado!"
+    exit 1
+fi
 
 # Verificar status do serviço
 echo "Verificando status do serviço..."
