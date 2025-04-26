@@ -16,6 +16,13 @@ echo "Instalando dependências..."
 apt-get update
 apt-get install -y git golang-go
 
+# Limpar instalação anterior se existir
+echo "Limpando instalação anterior..."
+if [ -d "/opt/mtm_agent" ]; then
+    systemctl stop mtm-agent.service || true
+    rm -rf /opt/mtm_agent/*
+fi
+
 # Criar diretório de instalação
 echo "Criando diretório de instalação..."
 mkdir -p /opt/mtm_agent
