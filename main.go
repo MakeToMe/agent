@@ -1,65 +1,68 @@
 package main
 
 import (
-	"context"
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
-	"os"
+	"net/http"
+	"os/exec"
+	"sort"
 	"strings"
-
-	"github.com/joho/godotenv"
-	supabase "github.com/supabase-community/supabase-go"
+	"time"
 )
 
-type ServidorInfo struct {
-	UID       string
-	Titular   string
-	ServidorIP string
+// Estruturas para API
+type BanIP struct {
+	IP2Ban string `json:"ip2ban"`
+}
+
+type BanList struct {
+	IP      string  `json:"ip"`
+	BanList []BanIP `json:"ban_list"`
+}
+
+// LoginFailure representa uma falha de login com contagem
+type LoginFailure struct {
+	IP    string
+	Count int
 }
 
 func main() {
-	// Carrega variáveis do .env
-	err := godotenv.Load()
-	if err != nil {
-		log.Println("Arquivo .env não encontrado, usando variáveis de ambiente do sistema.")
-	}
-
-	supabaseUrl := os.Getenv("SUPABASE_URL")
-	supabaseKey := os.Getenv("SUPABASE_SERVICE_KEY")
-	if supabaseUrl == "" || supabaseKey == "" {
-		log.Fatal("SUPABASE_URL ou SUPABASE_SERVICE_KEY não definidos.")
-	}
-
-	client := supabase.NewClient(supabaseUrl, supabaseKey, nil)
-	fmt.Println("Cliente Supabase inicializado com sucesso!")
-
-	// 1. Obter IP da VM
+	// Obter IP da VM
 	ip, err := getLocalIP()
 	if err != nil {
 		log.Fatalf("Erro ao obter IP local: %v", err)
 	}
 	fmt.Printf("IP local detectado: %s\n", ip)
 
-	// 2. Consultar na tabela servidores pelo IP
-	servidor, err := buscarServidorPorIP(client, ip)
-	if err != nil {
-		log.Fatalf("Erro ao buscar servidor no Supabase: %v", err)
-	}
-	fmt.Printf("Servidor encontrado: UID=%s, Titular=%s, IP=%s\n", servidor.UID, servidor.Titular, servidor.ServidorIP)
+	// Iniciar servidor HTTP para endpoints locais
+	go startHTTPServer()
 
-	// 3. Registrar/atualizar status do firewall na tabela firewall_status
-	firewallType := detectarTipoFirewall() // placeholder para detecção real
-	firewallActive := true                 // placeholder, definir conforme detecção real
-	err = registrarStatusFirewall(client, servidor, firewallType, firewallActive)
-	if err != nil {
-		log.Fatalf("Erro ao registrar status do firewall: %v", err)
-	}
-	fmt.Println("Status do firewall registrado/atualizado com sucesso!")
+	// Iniciar rotina para executar lastb e enviar lista de IPs banidos a cada 5 minutos
+	ticker := time.NewTicker(5 * time.Minute)
+	go func() {
+		// Executar imediatamente na primeira execução
+		failedLogins, err := getFailedLogins()
+		if err != nil {
+			log.Printf("Erro ao obter logins falhos: %v\n", err)
+		} else {
+			sendBannedIPsList(ip, failedLogins)
+		}
+		
+		for range ticker.C {
+			failedLogins, err := getFailedLogins()
+			if err != nil {
+				log.Printf("Erro ao obter logins falhos: %v\n", err)
+				continue
+			}
+			sendBannedIPsList(ip, failedLogins)
+		}
+	}()
 
-	// 4. (Próximo passo) Função para inserir IPs banidos, evitando duplicidade
-	// err = registrarBanimento(client, servidor, "1.2.3.4")
-	// if err != nil { ... }
+	// Manter o programa em execução
+	select {}
 }
 
 // detectarTipoFirewall é um placeholder para detectar o tipo real do firewall na VM
@@ -68,36 +71,10 @@ func detectarTipoFirewall() string {
 	return "ufw"
 }
 
-// registrarStatusFirewall insere ou atualiza o status do firewall para o servidor
-func registrarStatusFirewall(client *supabase.Client, servidor *ServidorInfo, firewallType string, active bool) error {
-	ctx := context.Background()
-	// Verifica se já existe registro para o servidor_id
-	resp, err := client.From("firewall_status").Select("id").Eq("servidor_id", servidor.UID).Execute(ctx)
-	if err != nil {
-		return err
-	}
-	if strings.Contains(resp.String(), "id") {
-		// Já existe, atualiza
-		_, err = client.From("firewall_status").Update(map[string]interface{}{
-			"firewall_type": firewallType,
-			"active":        active,
-			"servidor_ip":   servidor.ServidorIP,
-			"titular":       servidor.Titular,
-			"updated_at":    "now()",
-		}).Eq("servidor_id", servidor.UID).Execute(ctx)
-		return err
-	} else {
-		// Não existe, insere
-		_, err = client.From("firewall_status").Insert(map[string]interface{}{
-			"servidor_id":   servidor.UID,
-			"titular":       servidor.Titular,
-			"firewall_type": firewallType,
-			"active":        active,
-			"servidor_ip":   servidor.ServidorIP,
-		}).Execute(ctx)
-		return err
-	}
-}
+// PAUSA - Esta função será refatorada posteriormente
+// func registrarStatusFirewall() {
+// 	// Implementação futura
+// }
 
 
 // getLocalIP retorna o primeiro IP não-loopback encontrado na máquina
@@ -133,47 +110,177 @@ func getLocalIP() (string, error) {
 	return "", fmt.Errorf("nenhum IP válido encontrado")
 }
 
-// buscarServidorPorIP consulta a tabela 'servidores' pelo IP e retorna UID e Titular
-func buscarServidorPorIP(client *supabase.Client, ip string) (*ServidorInfo, error) {
-	ctx := context.Background()
-	resp, err := client.From("servidores").Select("uid,titular,ip").Eq("ip", ip).Execute(ctx)
+// startHTTPServer inicia o servidor HTTP para os endpoints locais
+func startHTTPServer() {
+	// Endpoint para banir IP
+	http.HandleFunc("/ban", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Método não permitido", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var payload struct {
+			IP string `json:"ip"`
+		}
+
+		decoder := json.NewDecoder(r.Body)
+		if err := decoder.Decode(&payload); err != nil {
+			http.Error(w, "Erro ao decodificar JSON: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		// TODO: Implementar o banimento real do IP usando o firewall
+		fmt.Printf("Banindo IP: %s\n", payload.IP)
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":  "ok",
+			"message": fmt.Sprintf("IP banned: %s", payload.IP),
+		})
+	})
+
+	// Endpoint para desbanir IP
+	http.HandleFunc("/unban", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Método não permitido", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var payload struct {
+			IP string `json:"ip"`
+		}
+
+		decoder := json.NewDecoder(r.Body)
+		if err := decoder.Decode(&payload); err != nil {
+			http.Error(w, "Erro ao decodificar JSON: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		// TODO: Implementar o desbanimento real do IP usando o firewall
+		fmt.Printf("Desbanindo IP: %s\n", payload.IP)
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":  "ok",
+			"message": fmt.Sprintf("IP unbanned: %s", payload.IP),
+		})
+	})
+
+	// Endpoint opcional para verificar status
+	http.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Método não permitido", http.StatusMethodNotAllowed)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":  "ok",
+			"message": "MTM Agent está em execução",
+		})
+	})
+
+	fmt.Println("Servidor HTTP iniciado na porta 9000")
+	if err := http.ListenAndServe(":9000", nil); err != nil {
+		log.Fatalf("Erro ao iniciar servidor HTTP: %v", err)
+	}
+}
+
+// getFailedLogins obtém a lista de falhas de login do sistema usando lastb e agrega por IP
+func getFailedLogins() ([]LoginFailure, error) {
+	// Comando shell completo para extrair IPs com 3 ou mais tentativas falhas
+	// 1. lastb -i: lista tentativas falhas com IPs
+	// 2. grep: extrai apenas os IPs
+	// 3. sort e uniq -c: conta ocorrências únicas
+	// 4. sort -nr: ordena por número de ocorrências (maior para menor)
+	cmd := exec.Command("bash", "-c", 
+		"lastb -i | grep -o -E '\\b([0-9]{1,3}\\.){3}[0-9]{1,3}\\b' | sort | uniq -c | sort -nr")
+	output, err := cmd.CombinedOutput()
+
 	if err != nil {
-		return nil, err
+		// Verificamos se temos alguma saída antes de retornar erro
+		if len(output) == 0 {
+			return nil, fmt.Errorf("erro ao executar comando de agregação de IPs: %v", err)
+		}
 	}
-	if resp.StatusCode != 200 || !strings.Contains(resp.String(), "uid") {
-		return nil, fmt.Errorf("servidor não encontrado para o IP %s", ip)
+
+	// Processar a saída formatada como "  COUNT IP"
+	var failures []LoginFailure
+	lines := strings.Split(string(output), "\n")
+	
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		
+		// Formato esperado: "  COUNT IP"
+		parts := strings.Fields(line)
+		if len(parts) == 2 {
+			count := 0
+			_, err := fmt.Sscanf(parts[0], "%d", &count)
+			if err != nil || count == 0 {
+				continue
+			}
+			
+			ip := parts[1]
+			failures = append(failures, LoginFailure{IP: ip, Count: count})
+		}
 	}
-	// Parse simples do JSON de resposta (pode ser melhorado com struct)
-	uid := extrairValor(resp.String(), "uid")
-	titular := extrairValor(resp.String(), "titular")
-	servidorIP := extrairValor(resp.String(), "ip")
-	return &ServidorInfo{UID: uid, Titular: titular, ServidorIP: servidorIP}, nil
+
+	// Ordenar por contagem (maior para menor)
+	sort.Slice(failures, func(i, j int) bool {
+		return failures[i].Count > failures[j].Count
+	})
+
+	// Limitar aos top 100 IPs com mais falhas
+	if len(failures) > 100 {
+		failures = failures[:100]
+	}
+
+	return failures, nil
+
+
 }
 
-// extrairValor é um parse simples para pegar o valor de uma chave em um JSON flat (melhorar para produção)
-func extrairValor(json, chave string) string {
-	idx := strings.Index(json, chave)
-	if idx == -1 {
-		return ""
+// sendBannedIPsList envia a lista de IPs banidos para a API externa
+func sendBannedIPsList(localIP string, failedLogins []LoginFailure) {
+	// Converter falhas de login para o formato esperado pela API
+	var bannedIPs []BanIP
+	for _, failure := range failedLogins {
+		// Já filtramos por 3 ou mais falhas no comando shell, mas mantemos a verificação por segurança
+		if failure.Count >= 3 {
+			bannedIPs = append(bannedIPs, BanIP{IP2Ban: failure.IP})
+		}
 	}
-	start := strings.Index(json[idx:], ":")
-	if start == -1 {
-		return ""
-	}
-	start += idx + 2
-	end := strings.IndexAny(json[start:], ",}\n")
-	if end == -1 {
-		return strings.Trim(json[start:], "\" ")
-	}
-	return strings.Trim(json[start:start+end], "\" ")
-}
 
-// registrarBanimento (a implementar):
-// Recebe o cliente, infos do servidor e um IP a ser banido
-// 1. Verifica se já existe banimento ativo para o IP e servidor_id
-// 2. Se não existir, insere na tabela banned_ips
-// func registrarBanimento(client *supabase.Client, servidor *ServidorInfo, ipBanido string) error {
-// 	// TODO
-// 	return nil
-// }
+	// Se não houver IPs para banir, ainda enviamos uma lista vazia
+	payload := BanList{
+		IP:      localIP,
+		BanList: bannedIPs,
+	}
+
+	// Log para depuração
+	fmt.Printf("Enviando %d IPs suspeitos para API\n", len(bannedIPs))
+
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("Erro ao serializar JSON: %v\n", err)
+		return
+	}
+
+	resp, err := http.Post("http://170.205.37.204:8081/listbanip", "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		log.Printf("Erro ao enviar lista de IPs banidos: %v\n", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("Erro ao enviar lista de IPs banidos. Status: %d\n", resp.StatusCode)
+		return
+	}
+
+	fmt.Println("Lista de IPs banidos enviada com sucesso!")
+}
 

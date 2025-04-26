@@ -4,7 +4,7 @@
 *.local
 # Ignorar cache do Go
 /go.sum
-/go.mod
+#/go.mod
 # Ignorar arquivos temporários do sistema
 .DS_Store
 Thumbs.db

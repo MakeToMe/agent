@@ -1,0 +1,14 @@
+[Unit]
+Description=MTM Agent Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/mtm_agent
+ExecStart=/opt/mtm_agent/mtm_agent
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

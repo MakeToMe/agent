@@ -1,27 +1,76 @@
-# MTM Agent - Módulo Supabase (Golang)
+# MTM Agent
 
-Este módulo inicializa a conexão segura com o Supabase utilizando variáveis sensíveis em um arquivo `.env` (não versionado), garantindo que a chave secret não fique exposta publicamente.
+O MTM Agent é um serviço que monitora tentativas de login falhas no sistema Linux e envia a lista de IPs suspeitos para uma API central. Também fornece endpoints HTTP locais para banir ou desbanir IPs específicos.
 
-## Dependências
-- [supabase-community/supabase-go](https://github.com/supabase-community/supabase-go)
-- [joho/godotenv](https://github.com/joho/godotenv)
+## Funcionalidades
 
-## Como usar
+- Detecta o IP local do servidor
+- Monitora tentativas de login falhas usando o comando `lastb`
+- Agrega e ordena IPs por quantidade de falhas
+- Envia IPs suspeitos (com 3 ou mais falhas) para API central
+- Fornece endpoints HTTP locais para banir/desbanir IPs
 
-1. Copie o arquivo `.env.example` para `.env` e preencha com as credenciais reais.
-2. Instale as dependências:
-   ```sh
+## Instalação Rápida
+
+Para instalar o MTM Agent, execute o seguinte comando como root:
+
+```bash
+wget -O - https://raw.githubusercontent.com/MakeToMe/agent/main/install.sh | bash
+```
+
+Ou baixe e execute o script manualmente:
+
+```bash
+wget https://raw.githubusercontent.com/MakeToMe/agent/main/install.sh
+chmod +x install.sh
+sudo ./install.sh
+```
+
+## Instalação Manual
+
+1. Clone o repositório:
+   ```bash
+   git clone https://github.com/MakeToMe/agent.git
+   cd agent
+   ```
+
+2. Compile o código:
+   ```bash
    go mod tidy
+   go build -o mtm_agent
    ```
-3. Execute o serviço:
-   ```sh
-   go run main.go
+
+3. Configure o serviço systemd:
+   ```bash
+   sudo cp mtm-agent.service /etc/systemd/system/
+   sudo systemctl daemon-reload
+   sudo systemctl enable mtm-agent.service
+   sudo systemctl start mtm-agent.service
    ```
+
+## Uso
+
+O serviço inicia automaticamente após a instalação e na inicialização do sistema. Ele executa as seguintes ações:
+
+1. A cada 5 minutos, verifica tentativas de login falhas e envia IPs suspeitos para a API central
+2. Fornece endpoints HTTP na porta 9000:
+   - `POST /ban` - Banir um IP específico
+   - `POST /unban` - Desbanir um IP específico
+   - `GET /status` - Verificar status do serviço
+
+## Monitoramento
+
+Para verificar o status do serviço:
+```bash
+sudo systemctl status mtm-agent.service
+```
+
+Para ver os logs:
+```bash
+sudo journalctl -u mtm-agent.service -f
+```
 
 ## Segurança
-- A chave `SUPABASE_SERVICE_KEY` nunca deve ser exposta em código público.
-- O arquivo `.env` deve ser adicionado ao `.gitignore`.
 
-## Próximos passos
-- Implementar consulta ao IP do servidor e buscar o titular na tabela `servidores`.
-- Interagir com a tabela `banned_ips` conforme o fluxo de integração.
+- O serviço deve ser executado como root para acessar os logs de login e manipular regras de firewall
+- Os endpoints HTTP só estão disponíveis localmente (localhost:9000)
