@@ -709,15 +709,16 @@ func getLocalIP() (string, error) {
 
 // startHTTPServer inicia o servidor HTTP para os endpoints locais
 func startHTTPServer() {
-	// Endpoint para banir IP
-	http.HandleFunc("/ban", func(w http.ResponseWriter, r *http.Request) {
+	// Endpoint para gerenciar IPs (banir/desbanir)
+	http.HandleFunc("/ip", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Método não permitido", http.StatusMethodNotAllowed)
 			return
 		}
 
 		var payload struct {
-			IP string `json:"ip"`
+			IP    string `json:"ip"`
+			Acao  string `json:"acao"` // "banir" ou "desbanir"
 		}
 
 		decoder := json.NewDecoder(r.Body)
@@ -726,42 +727,91 @@ func startHTTPServer() {
 			return
 		}
 
-		// TODO: Implementar o banimento real do IP usando o firewall
-		fmt.Printf("Banindo IP: %s\n", payload.IP)
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{
-			"status":  "ok",
-			"message": fmt.Sprintf("IP banned: %s", payload.IP),
-		})
-	})
-
-	// Endpoint para desbanir IP
-	http.HandleFunc("/unban", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Método não permitido", http.StatusMethodNotAllowed)
+		// Verificar se o IP é válido
+		if net.ParseIP(payload.IP) == nil {
+			http.Error(w, "IP inválido", http.StatusBadRequest)
 			return
 		}
 
-		var payload struct {
-			IP string `json:"ip"`
-		}
-
-		decoder := json.NewDecoder(r.Body)
-		if err := decoder.Decode(&payload); err != nil {
-			http.Error(w, "Erro ao decodificar JSON: "+err.Error(), http.StatusBadRequest)
+		// Verificar se a ação é válida
+		if payload.Acao != "banir" && payload.Acao != "desbanir" {
+			http.Error(w, "Ação inválida. Deve ser 'banir' ou 'desbanir'", http.StatusBadRequest)
 			return
 		}
 
-		// TODO: Implementar o desbanimento real do IP usando o firewall
-		fmt.Printf("Desbanindo IP: %s\n", payload.IP)
+		// Verificar se o ipset está instalado
+		checkIpsetCmd := exec.Command("bash", "-c", "command -v ipset || echo 'not-installed'")
+		ipsetOutput, _ := checkIpsetCmd.CombinedOutput()
+		if strings.Contains(string(ipsetOutput), "not-installed") {
+			// Instalar ipset se não estiver disponível
+			fmt.Println("ipset não está instalado. Instalando...")
+			installCmd := exec.Command("bash", "-c", "apt-get update && apt-get install -y ipset")
+			installOutput, err := installCmd.CombinedOutput()
+			if err != nil {
+				fmt.Printf("Erro ao instalar ipset: %v\n%s\n", err, string(installOutput))
+				http.Error(w, "Erro ao instalar ipset", http.StatusInternalServerError)
+				return
+			}
+		}
 
+		// Criar o conjunto ipset se não existir
+		exec.Command("bash", "-c", "ipset create -exist mtm-banned-ips hash:ip").Run()
+
+		// Garantir que a regra do iptables que usa o ipset exista
+		checkRuleCmd := exec.Command("bash", "-c", "iptables -C INPUT -m set --match-set mtm-banned-ips src -j DROP 2>/dev/null || echo 'not-exists'")
+		output, _ := checkRuleCmd.CombinedOutput()
+		if strings.Contains(string(output), "not-exists") {
+			exec.Command("bash", "-c", "iptables -A INPUT -m set --match-set mtm-banned-ips src -j DROP").Run()
+		}
+
+		var resultMsg string
+
+		if payload.Acao == "banir" {
+			// Adicionar o IP ao ipset
+			cmd := exec.Command("bash", "-c", fmt.Sprintf("ipset add mtm-banned-ips %s", payload.IP))
+			actionOutput, err := cmd.CombinedOutput()
+			if err != nil {
+				// Verificar se o erro é porque o IP já está no conjunto
+				if strings.Contains(string(actionOutput), "already") {
+					resultMsg = fmt.Sprintf("IP já está banido: %s", payload.IP)
+				} else {
+					fmt.Printf("Erro ao banir IP %s: %v\n%s\n", payload.IP, err, string(actionOutput))
+					http.Error(w, fmt.Sprintf("Erro ao banir IP: %v", err), http.StatusInternalServerError)
+					return
+				}
+			} else {
+				resultMsg = fmt.Sprintf("IP banido com sucesso: %s", payload.IP)
+			}
+		} else { // desbanir
+			// Remover o IP do ipset
+			cmd := exec.Command("bash", "-c", fmt.Sprintf("ipset del mtm-banned-ips %s 2>/dev/null || echo 'not-in-set'", payload.IP))
+			actionOutput, err := cmd.CombinedOutput()
+			if err != nil && !strings.Contains(string(actionOutput), "not-in-set") {
+				fmt.Printf("Erro ao desbanir IP %s: %v\n%s\n", payload.IP, err, string(actionOutput))
+				http.Error(w, fmt.Sprintf("Erro ao desbanir IP: %v", err), http.StatusInternalServerError)
+				return
+			}
+
+			// Verificar se o IP estava no conjunto
+			if strings.Contains(string(actionOutput), "not-in-set") {
+				resultMsg = fmt.Sprintf("IP não estava banido: %s", payload.IP)
+			} else {
+				resultMsg = fmt.Sprintf("IP desbanido com sucesso: %s", payload.IP)
+			}
+		}
+
+		// Salvar o ipset para persistência
+		exec.Command("bash", "-c", "ipset save > /etc/ipset.conf").Run()
+
+		fmt.Println(resultMsg)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{
 			"status":  "ok",
-			"message": fmt.Sprintf("IP unbanned: %s", payload.IP),
+			"message": resultMsg,
 		})
 	})
+
+	// Endpoint /unban foi substituído pelo /ip com ação "desbanir"
 
 	// Endpoint opcional para verificar status
 	http.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
@@ -774,6 +824,334 @@ func startHTTPServer() {
 		json.NewEncoder(w).Encode(map[string]string{
 			"status":  "ok",
 			"message": "MTM Agent está em execução",
+		})
+	})
+
+	// Endpoint para gerenciar whitelist (adicionar/excluir IPs)
+	http.HandleFunc("/whitelist", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Método não permitido", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var payload struct {
+			IP    string `json:"ip"`
+			Acao  string `json:"acao"` // "adicionar" ou "excluir"
+		}
+
+		decoder := json.NewDecoder(r.Body)
+		if err := decoder.Decode(&payload); err != nil {
+			http.Error(w, "Erro ao decodificar JSON: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		// Verificar se o IP é válido
+		if net.ParseIP(payload.IP) == nil {
+			http.Error(w, "IP inválido", http.StatusBadRequest)
+			return
+		}
+
+		// Verificar se a ação é válida
+		if payload.Acao != "adicionar" && payload.Acao != "excluir" {
+			http.Error(w, "Ação inválida. Deve ser 'adicionar' ou 'excluir'", http.StatusBadRequest)
+			return
+		}
+
+		// Verificar se o ipset está instalado
+		checkIpsetCmd := exec.Command("bash", "-c", "command -v ipset || echo 'not-installed'")
+		ipsetOutput, _ := checkIpsetCmd.CombinedOutput()
+		if strings.Contains(string(ipsetOutput), "not-installed") {
+			// Instalar ipset se não estiver disponível
+			fmt.Println("ipset não está instalado. Instalando...")
+			installCmd := exec.Command("bash", "-c", "apt-get update && apt-get install -y ipset")
+			installOutput, err := installCmd.CombinedOutput()
+			if err != nil {
+				fmt.Printf("Erro ao instalar ipset: %v\n%s\n", err, string(installOutput))
+				http.Error(w, "Erro ao instalar ipset", http.StatusInternalServerError)
+				return
+			}
+		}
+
+		// Criar o conjunto whitelist se não existir
+		exec.Command("bash", "-c", "ipset create -exist mtm-whitelist hash:ip").Run()
+
+		// Garantir que a regra do iptables que usa a whitelist exista
+		checkRuleCmd := exec.Command("bash", "-c", "iptables -C INPUT -m set --match-set mtm-whitelist src -j ACCEPT 2>/dev/null || echo 'not-exists'")
+		output, _ := checkRuleCmd.CombinedOutput()
+		if strings.Contains(string(output), "not-exists") {
+			// Adicionar a regra ANTES da regra de DROP para garantir que IPs na whitelist não sejam bloqueados
+			exec.Command("bash", "-c", "iptables -I INPUT 1 -m set --match-set mtm-whitelist src -j ACCEPT").Run()
+		}
+
+		var resultMsg string
+
+		if payload.Acao == "adicionar" {
+			// Adicionar o IP à whitelist
+			cmd := exec.Command("bash", "-c", fmt.Sprintf("ipset add mtm-whitelist %s", payload.IP))
+			actionOutput, err := cmd.CombinedOutput()
+			if err != nil {
+				// Verificar se o erro é porque o IP já está no conjunto
+				if strings.Contains(string(actionOutput), "already") {
+					resultMsg = fmt.Sprintf("IP já está na whitelist: %s", payload.IP)
+				} else {
+					fmt.Printf("Erro ao adicionar IP %s à whitelist: %v\n%s\n", payload.IP, err, string(actionOutput))
+					http.Error(w, fmt.Sprintf("Erro ao adicionar IP à whitelist: %v", err), http.StatusInternalServerError)
+					return
+				}
+			} else {
+				resultMsg = fmt.Sprintf("IP adicionado à whitelist com sucesso: %s", payload.IP)
+				
+				// Remover o IP da lista de banidos, se estiver lá
+				exec.Command("bash", "-c", fmt.Sprintf("ipset del mtm-banned-ips %s 2>/dev/null || true", payload.IP)).Run()
+			}
+		} else { // excluir
+			// Remover o IP da whitelist
+			cmd := exec.Command("bash", "-c", fmt.Sprintf("ipset del mtm-whitelist %s 2>/dev/null || echo 'not-in-set'", payload.IP))
+			actionOutput, err := cmd.CombinedOutput()
+			if err != nil && !strings.Contains(string(actionOutput), "not-in-set") {
+				fmt.Printf("Erro ao remover IP %s da whitelist: %v\n%s\n", payload.IP, err, string(actionOutput))
+				http.Error(w, fmt.Sprintf("Erro ao remover IP da whitelist: %v", err), http.StatusInternalServerError)
+				return
+			}
+
+			// Verificar se o IP estava no conjunto
+			if strings.Contains(string(actionOutput), "not-in-set") {
+				resultMsg = fmt.Sprintf("IP não estava na whitelist: %s", payload.IP)
+			} else {
+				resultMsg = fmt.Sprintf("IP removido da whitelist com sucesso: %s", payload.IP)
+			}
+		}
+
+		// Salvar o ipset para persistência
+		exec.Command("bash", "-c", "ipset save > /etc/ipset.conf").Run()
+
+		fmt.Println(resultMsg)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":  "ok",
+			"message": resultMsg,
+		})
+	})
+
+	// Endpoint para gerenciar regras por domínio
+	http.HandleFunc("/domain", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Método não permitido", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var payload struct {
+			Domain string `json:"domain"`
+			Acao   string `json:"acao"` // "block" ou "allow"
+		}
+
+		decoder := json.NewDecoder(r.Body)
+		if err := decoder.Decode(&payload); err != nil {
+			http.Error(w, "Erro ao decodificar JSON: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		// Validar payload
+		if payload.Domain == "" {
+			http.Error(w, "Domínio não pode ser vazio", http.StatusBadRequest)
+			return
+		}
+
+		if payload.Acao != "block" && payload.Acao != "allow" {
+			http.Error(w, "Ação inválida. Deve ser 'block' ou 'allow'", http.StatusBadRequest)
+			return
+		}
+
+		// Resolver o domínio para obter os IPs
+		ips, err := net.LookupHost(payload.Domain)
+		if err != nil {
+			fmt.Printf("Erro ao resolver domínio %s: %v\n", payload.Domain, err)
+			http.Error(w, fmt.Sprintf("Erro ao resolver domínio: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		if len(ips) == 0 {
+			http.Error(w, "Não foi possível resolver o domínio para nenhum IP", http.StatusBadRequest)
+			return
+		}
+
+		// Verificar se o ipset está instalado
+		checkIpsetCmd := exec.Command("bash", "-c", "command -v ipset || echo 'not-installed'")
+		ipsetOutput, _ := checkIpsetCmd.CombinedOutput()
+		if strings.Contains(string(ipsetOutput), "not-installed") {
+			// Instalar ipset se não estiver disponível
+			fmt.Println("ipset não está instalado. Instalando...")
+			installCmd := exec.Command("bash", "-c", "apt-get update && apt-get install -y ipset")
+			installOutput, err := installCmd.CombinedOutput()
+			if err != nil {
+				fmt.Printf("Erro ao instalar ipset: %v\n%s\n", err, string(installOutput))
+				http.Error(w, "Erro ao instalar ipset", http.StatusInternalServerError)
+				return
+			}
+		}
+
+		// Nome do conjunto para o domínio (sanitizado para uso no ipset)
+		setName := "mtm-domain-" + strings.Replace(strings.Replace(payload.Domain, ".", "-", -1), "_", "-", -1)
+		if len(setName) > 31 {
+			// ipset tem limite de 31 caracteres para nomes de conjuntos
+			setName = setName[:31]
+		}
+
+		// Criar o conjunto para o domínio se não existir
+		exec.Command("bash", "-c", fmt.Sprintf("ipset create -exist %s hash:ip", setName)).Run()
+
+		// Adicionar todos os IPs do domínio ao conjunto
+		for _, ip := range ips {
+			exec.Command("bash", "-c", fmt.Sprintf("ipset add %s %s 2>/dev/null || true", setName, ip)).Run()
+			fmt.Printf("IP %s adicionado ao conjunto %s\n", ip, setName)
+		}
+
+		// Verificar se a regra já existe e removê-la se existir (para evitar duplicação)
+		var actionValue string
+		if payload.Acao == "block" {
+			actionValue = "DROP"
+		} else {
+			actionValue = "ACCEPT"
+		}
+		checkRuleCmd := exec.Command("bash", "-c", fmt.Sprintf("iptables -C INPUT -m set --match-set %s src -j %s 2>/dev/null || echo 'not-exists'", 
+			setName, actionValue))
+		checkOutput, _ := checkRuleCmd.CombinedOutput()
+		if !strings.Contains(string(checkOutput), "not-exists") {
+			// Remover regra existente
+			exec.Command("bash", "-c", fmt.Sprintf("iptables -D INPUT -m set --match-set %s src -j %s", 
+				setName, actionValue)).Run()
+		}
+
+		// Adicionar a regra de firewall
+		action := "DROP"
+		if payload.Acao == "allow" {
+			action = "ACCEPT"
+		}
+
+		// Posição da regra: se for ACCEPT, colocar no início; se for DROP, colocar no final
+		position := ""
+		if payload.Acao == "allow" {
+			position = "-I INPUT 1"
+		} else {
+			position = "-A INPUT"
+		}
+
+		cmd := exec.Command("bash", "-c", fmt.Sprintf("iptables %s -m set --match-set %s src -j %s", 
+			position, setName, action))
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			fmt.Printf("Erro ao configurar regra para domínio %s: %v\n%s\n", payload.Domain, err, string(output))
+			http.Error(w, fmt.Sprintf("Erro ao configurar regra: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		// Salvar regras do iptables e ipset para persistência
+		exec.Command("bash", "-c", "iptables-save > /etc/iptables/rules.v4").Run()
+		exec.Command("bash", "-c", "ipset save > /etc/ipset.conf").Run()
+
+		resultMsg := fmt.Sprintf("Domínio %s configurado com sucesso para %s (%d IPs)", 
+			payload.Domain, payload.Acao, len(ips))
+		fmt.Println(resultMsg)
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "ok",
+			"message": resultMsg,
+			"ips":     ips,
+			"set_name": setName,
+		})
+	})
+
+	// Endpoint para abrir/fechar porta
+	http.HandleFunc("/port", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Método não permitido", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var payload struct {
+			Port     int    `json:"port"`
+			Protocol string `json:"protocol"`
+			Acao     string `json:"acao"` // "open" ou "close"
+			Source   string `json:"source"` // opcional, padrão "0.0.0.0/0"
+		}
+
+		decoder := json.NewDecoder(r.Body)
+		if err := decoder.Decode(&payload); err != nil {
+			http.Error(w, "Erro ao decodificar JSON: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		// Validar payload
+		if payload.Port <= 0 || payload.Port > 65535 {
+			http.Error(w, "Porta inválida. Deve estar entre 1 e 65535", http.StatusBadRequest)
+			return
+		}
+
+		if payload.Protocol != "tcp" && payload.Protocol != "udp" {
+			http.Error(w, "Protocolo inválido. Deve ser 'tcp' ou 'udp'", http.StatusBadRequest)
+			return
+		}
+
+		if payload.Acao != "open" && payload.Acao != "close" {
+			http.Error(w, "Ação inválida. Deve ser 'open' ou 'close'", http.StatusBadRequest)
+			return
+		}
+
+		// Definir source padrão se não especificado
+		if payload.Source == "" {
+			payload.Source = "0.0.0.0/0"
+		}
+
+		// Verificar se a regra já existe
+		checkCmd := exec.Command("bash", "-c", fmt.Sprintf("iptables -C INPUT -p %s --dport %d -s %s -j ACCEPT 2>/dev/null || echo 'not-exists'", 
+			payload.Protocol, payload.Port, payload.Source))
+		checkOutput, _ := checkCmd.CombinedOutput()
+		ruleExists := !strings.Contains(string(checkOutput), "not-exists")
+
+		var cmd *exec.Cmd
+		var resultMsg string
+
+		if payload.Acao == "open" {
+			if ruleExists {
+				resultMsg = fmt.Sprintf("Porta %d/%s já está aberta para %s", payload.Port, payload.Protocol, payload.Source)
+			} else {
+				// Adicionar regra para abrir a porta
+				cmd = exec.Command("bash", "-c", fmt.Sprintf("iptables -A INPUT -p %s --dport %d -s %s -j ACCEPT", 
+					payload.Protocol, payload.Port, payload.Source))
+				output, err := cmd.CombinedOutput()
+				if err != nil {
+					fmt.Printf("Erro ao abrir porta %d/%s: %v\n%s\n", payload.Port, payload.Protocol, err, string(output))
+					http.Error(w, fmt.Sprintf("Erro ao abrir porta: %v", err), http.StatusInternalServerError)
+					return
+				}
+				resultMsg = fmt.Sprintf("Porta %d/%s aberta com sucesso para %s", payload.Port, payload.Protocol, payload.Source)
+			}
+		} else { // close
+			if !ruleExists {
+				resultMsg = fmt.Sprintf("Porta %d/%s já está fechada para %s", payload.Port, payload.Protocol, payload.Source)
+			} else {
+				// Remover regra para fechar a porta
+				cmd = exec.Command("bash", "-c", fmt.Sprintf("iptables -D INPUT -p %s --dport %d -s %s -j ACCEPT", 
+					payload.Protocol, payload.Port, payload.Source))
+				output, err := cmd.CombinedOutput()
+				if err != nil {
+					fmt.Printf("Erro ao fechar porta %d/%s: %v\n%s\n", payload.Port, payload.Protocol, err, string(output))
+					http.Error(w, fmt.Sprintf("Erro ao fechar porta: %v", err), http.StatusInternalServerError)
+					return
+				}
+				resultMsg = fmt.Sprintf("Porta %d/%s fechada com sucesso para %s", payload.Port, payload.Protocol, payload.Source)
+			}
+		}
+
+		// Salvar regras do iptables para persistência
+		exec.Command("bash", "-c", "iptables-save > /etc/iptables/rules.v4").Run()
+
+		fmt.Println(resultMsg)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":  "ok",
+			"message": resultMsg,
 		})
 	})
 
