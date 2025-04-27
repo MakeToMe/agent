@@ -16,24 +16,15 @@ echo "Instalando dependências..."
 apt-get update
 apt-get install -y git ipset wget
 
-# Verificar a versão atual do Go
+# Remover versão antiga do Go para evitar conflitos
+echo "Removendo versões antigas do Go..."
+apt-get remove -y golang-go
+apt-get autoremove -y
+
+# Forçar a instalação do Go 1.21
 GO_VERSION="1.21.0"
-if command -v go &> /dev/null; then
-    CURRENT_GO_VERSION=$(go version | awk '{print $3}' | sed 's/go//g')
-    echo "Versão atual do Go: $CURRENT_GO_VERSION"
-    
-    # Comparar versões (simplificado)
-    if [[ "$CURRENT_GO_VERSION" == 1.* ]] && [[ "${CURRENT_GO_VERSION:2:2}" -lt 21 ]]; then
-        echo "Versão do Go muito antiga, instalando Go $GO_VERSION..."
-        INSTALL_GO=true
-    else
-        echo "Versão do Go já é adequada."
-        INSTALL_GO=false
-    fi
-else
-    echo "Go não encontrado, instalando Go $GO_VERSION..."
-    INSTALL_GO=true
-fi
+echo "Instalando Go $GO_VERSION para garantir compatibilidade..."
+INSTALL_GO=true
 
 # Instalar Go 1.21 se necessário
 if [ "$INSTALL_GO" = true ]; then
@@ -90,8 +81,15 @@ git clone https://github.com/MakeToMe/agent.git .
 
 # Compilar o código
 echo "Compilando o código..."
-go mod tidy
-go build -o mtm-agent
+/usr/local/go/bin/go mod tidy
+/usr/local/go/bin/go build -o mtm-agent
+
+# Verificar se o binário foi criado com sucesso
+if [ ! -f "mtm-agent" ]; then
+    echo "ERRO: Falha ao compilar o binário mtm-agent!"
+    exit 1
+fi
+echo "Binário compilado com sucesso: $(pwd)/mtm-agent"
 
 # Verificar se o arquivo de serviço existe
 echo "Configurando serviço systemd..."
