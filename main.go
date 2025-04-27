@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -405,62 +406,101 @@ func banirIPsMaliciosos() {
 		ipsParaBanir = ipsParaBanir[:5000]
 	}
 
-	// Identificar novos IPs para banir (que não estão no cache)
-	var novosIPs []string
-	for _, ip := range ipsParaBanir {
-		jáBanido := false
-		for _, bannedIP := range bannedIPsCache {
-			if ip == bannedIP {
-				jáBanido = true
-				break
-			}
-		}
-		if !jáBanido {
-			novosIPs = append(novosIPs, ip)
+	// Verificar se o ipset está instalado
+	checkIpsetCmd := exec.Command("bash", "-c", "command -v ipset || echo 'not-installed'")
+	ipsetOutput, _ := checkIpsetCmd.CombinedOutput()
+	if strings.Contains(string(ipsetOutput), "not-installed") {
+		fmt.Println("ipset não está instalado. Instalando...")
+		installCmd := exec.Command("bash", "-c", "apt-get update && apt-get install -y ipset")
+		installOutput, err := installCmd.CombinedOutput()
+		if err != nil {
+			fmt.Printf("Erro ao instalar ipset: %v\n%s\n", err, string(installOutput))
+			// Fallback para o método antigo se não conseguir instalar ipset
+			banirIPsComIptables(ipsParaBanir)
+			return
 		}
 	}
 
-	// Atualizar o cache com todos os IPs banidos
-	bannedIPsCache = ipsParaBanir
+	// Criar o conjunto ipset se não existir
+	exec.Command("bash", "-c", "ipset create -exist mtm-banned-ips hash:ip").Run()
 
-	// Banir apenas os novos IPs
-	if len(novosIPs) > 0 {
-		fmt.Printf("Banindo %d novos IPs maliciosos no firewall...\n", len(novosIPs))
-		for _, ip := range novosIPs {
+	// Garantir que a regra do iptables que usa o ipset exista
+	checkRuleCmd := exec.Command("bash", "-c", "iptables -C INPUT -m set --match-set mtm-banned-ips src -j DROP 2>/dev/null || echo 'not-exists'")
+	output, _ := checkRuleCmd.CombinedOutput()
+	if strings.Contains(string(output), "not-exists") {
+		exec.Command("bash", "-c", "iptables -A INPUT -m set --match-set mtm-banned-ips src -j DROP").Run()
+	}
+
+	// Banir cada IP (sem duplicação - o ipset automaticamente evita duplicatas)
+	fmt.Printf("Banindo %d IPs maliciosos usando ipset...\n", len(ipsParaBanir))
+	for _, ip := range ipsParaBanir {
+		exec.Command("bash", "-c", fmt.Sprintf("ipset add mtm-banned-ips %s", ip)).Run()
+	}
+
+	// Salvar o ipset para persistência
+	exec.Command("bash", "-c", "ipset save > /etc/ipset.conf").Run()
+
+	// Atualizar o cache para uso futuro
+	bannedIPsCache = ipsParaBanir
+}
+
+// banirIPsComIptables é o método de banimento usando apenas iptables
+// Usado como fallback se o ipset não estiver disponível
+func banirIPsComIptables(ipsParaBanir []string) {
+	// Banir cada IP usando o firewall
+	fmt.Printf("Banindo %d IPs maliciosos usando iptables (método legado)...\n", len(ipsParaBanir))
+	for _, ip := range ipsParaBanir {
+		// Verificar se o IP já está banido para evitar duplicação
+		checkCmd := exec.Command("bash", "-c", fmt.Sprintf("iptables -C INPUT -s %s -j DROP 2>/dev/null || echo 'not-exists'", ip))
+		output, _ := checkCmd.CombinedOutput()
+		if strings.Contains(string(output), "not-exists") {
+			// Banir o IP usando iptables
 			switch firewallType {
 			case "ufw":
 				exec.Command("bash", "-c", fmt.Sprintf("ufw deny from %s comment 'IP malicioso'", ip)).Run()
 			case "firewalld":
 				exec.Command("bash", "-c", fmt.Sprintf("firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=%s drop'", ip)).Run()
-			case "iptables":
+				exec.Command("bash", "-c", "firewall-cmd --reload").Run()
+			default: // iptables
 				exec.Command("bash", "-c", fmt.Sprintf("iptables -A INPUT -s %s -j DROP", ip)).Run()
 			}
 		}
-
-		// Recarregar firewalld se necessário
-		if firewallType == "firewalld" {
-			exec.Command("bash", "-c", "firewall-cmd --reload").Run()
-		}
-	} else {
-		fmt.Println("Nenhum novo IP malicioso para banir no firewall")
 	}
+
+	// Atualizar o cache para uso futuro
+	bannedIPsCache = ipsParaBanir
 }
 
 // enviarStatusFirewall envia o status do firewall para a API
 func enviarStatusFirewall(status FirewallStatus) {
+	// Log detalhado dos dados sendo enviados
+	fmt.Printf("Enviando status do firewall para API: IP=%s, Tipo=%s, Ativo=%v\n", 
+		status.IP, status.FirewallType, status.Active)
+	
 	jsonData, err := json.Marshal(status)
 	if err != nil {
 		fmt.Printf("Erro ao serializar status do firewall: %v\n", err)
 		return
 	}
 
-	resp, err := http.Post("http://170.205.37.204:8081/firewall_status", "application/json", bytes.NewBuffer(jsonData))
+	// Log do JSON sendo enviado
+	fmt.Printf("JSON do status: %s\n", string(jsonData))
+	
+	// Usar o endpoint correto
+	endpoint := "http://170.205.37.204:8081/firewall_status"
+	fmt.Printf("Enviando POST para: %s\n", endpoint)
+	
+	resp, err := http.Post(endpoint, "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
 		fmt.Printf("Erro ao enviar status do firewall: %v\n", err)
 		return
 	}
 	defer resp.Body.Close()
 
+	// Ler e logar a resposta
+	respBody, _ := io.ReadAll(resp.Body)
+	fmt.Printf("Resposta da API (status %d): %s\n", resp.StatusCode, string(respBody))
+	
 	if resp.StatusCode != http.StatusOK {
 		fmt.Printf("Erro ao enviar status do firewall. Status: %d\n", resp.StatusCode)
 		return
@@ -471,19 +511,34 @@ func enviarStatusFirewall(status FirewallStatus) {
 
 // enviarRegraFirewall envia uma regra de firewall para a API
 func enviarRegraFirewall(rule FirewallRule) {
+	// Log detalhado dos dados sendo enviados
+	fmt.Printf("Enviando regra de firewall: IP=%s, Porta=%d, Protocolo=%s, Ação=%s\n", 
+		rule.IP, rule.Port, rule.Protocol, rule.Action)
+	
 	jsonData, err := json.Marshal(rule)
 	if err != nil {
 		fmt.Printf("Erro ao serializar regra de firewall: %v\n", err)
 		return
 	}
 
-	resp, err := http.Post("http://170.205.37.204:8081/firewall_rules", "application/json", bytes.NewBuffer(jsonData))
+	// Log do JSON sendo enviado
+	fmt.Printf("JSON da regra: %s\n", string(jsonData))
+	
+	// Usar o endpoint correto
+	endpoint := "http://170.205.37.204:8081/firewall_rules"
+	fmt.Printf("Enviando POST para: %s\n", endpoint)
+	
+	resp, err := http.Post(endpoint, "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
 		fmt.Printf("Erro ao enviar regra de firewall: %v\n", err)
 		return
 	}
 	defer resp.Body.Close()
 
+	// Ler e logar a resposta
+	respBody, _ := io.ReadAll(resp.Body)
+	fmt.Printf("Resposta da API (status %d): %s\n", resp.StatusCode, string(respBody))
+	
 	if resp.StatusCode != http.StatusOK {
 		fmt.Printf("Erro ao enviar regra de firewall. Status: %d\n", resp.StatusCode)
 		return
@@ -659,11 +714,13 @@ func getFailedLogins(isFirstRun bool) ([]LoginFailure, error) {
 			"lastb -i | grep -o -E '\\b([0-9]{1,3}\\.){3}[0-9]{1,3}\\b' | sort | uniq -c | sort -nr")
 	} else {
 		// Ciclos subsequentes: obter apenas IPs dos últimos 8 minutos
-		// Usamos o comando date para obter a data/hora de 8 minutos atrás no formato que o lastb aceita
+		// O lastb não tem uma opção direta para filtrar por tempo, então usamos o comando
+		// 'awk' para filtrar com base no timestamp das entradas
 		fmt.Println("Executando comando para obter falhas de login dos últimos 8 minutos...")
 		cmd = exec.Command("bash", "-c", 
-			"TIMEFILTER=$(date --date='8 minutes ago' '+%Y%m%d%H%M%S') && " +
-			"lastb -i -t $TIMEFILTER | grep -o -E '\\b([0-9]{1,3}\\.){3}[0-9]{1,3}\\b' | sort | uniq -c | sort -nr")
+			"TIME_THRESHOLD=$(date -d '8 minutes ago' '+%s') && " +
+			"lastb -i | awk -v threshold=$TIME_THRESHOLD '{cmd=\"date -d \"$4\" \"$5\" \"$6\" \"$7\" \"$8\" +%s\"; cmd | getline ts; close(cmd); if (ts >= threshold) print}' | " +
+			"grep -o -E '\\b([0-9]{1,3}\\.){3}[0-9]{1,3}\\b' | sort | uniq -c | sort -nr")
 	}
 	
 	output, err := cmd.CombinedOutput()
