@@ -14,7 +14,7 @@ echo "Iniciando instalação do MTM Agent..."
 # Instalar dependências
 echo "Instalando dependências..."
 apt-get update
-apt-get install -y git golang-go
+apt-get install -y git golang-go ipset
 
 # VERIFICAÇÃO: O projeto já existe?
 if [ -d "/opt/mtm_agent" ] || [ -f "/etc/systemd/system/mtm-agent.service" ]; then
@@ -66,6 +66,20 @@ if [ -f "mtm-agent.service" ]; then
 else
     echo "ERRO: Arquivo mtm-agent.service não encontrado!"
     exit 1
+fi
+
+# Configurar ipset para persistência após reinicialização
+echo "Configurando ipset para persistência..."
+if [ ! -f "/etc/network/if-pre-up.d/ipset" ]; then
+    cat > /etc/network/if-pre-up.d/ipset << 'EOF'
+#!/bin/sh
+if [ -f /etc/ipset.conf ]; then
+    ipset restore < /etc/ipset.conf
+fi
+exit 0
+EOF
+    chmod +x /etc/network/if-pre-up.d/ipset
+    echo "Script de persistência do ipset criado em /etc/network/if-pre-up.d/ipset"
 fi
 
 # Verificar status do serviço
