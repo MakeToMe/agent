@@ -83,6 +83,9 @@ func main() {
 		if err != nil {
 			fmt.Printf("Erro ao configurar firewall: %v\n", err)
 		}
+		
+		// Adicionar alguns IPs de teste para garantir que o ipset esteja funcionando
+		testarBanimentoIPs()
 	}
 
 	// Iniciar rotina para executar lastb e enviar lista de IPs banidos a cada 5 minutos
@@ -393,17 +396,27 @@ func banirIPsMaliciosos() {
 		return
 	}
 
+	// Log do número total de falhas encontradas
+	fmt.Printf("Total de falhas de login encontradas: %d\n", len(failedLogins))
+
 	// Filtrar IPs com 3 ou mais falhas
 	var ipsParaBanir []string
 	for _, failure := range failedLogins {
 		if failure.Count >= 3 {
 			ipsParaBanir = append(ipsParaBanir, failure.IP)
+			fmt.Printf("IP para banir: %s (falhas: %d)\n", failure.IP, failure.Count)
 		}
 	}
 
 	// Limitar aos primeiros 5000 IPs para evitar sobrecarga
 	if len(ipsParaBanir) > 5000 {
 		ipsParaBanir = ipsParaBanir[:5000]
+	}
+	
+	// Se não houver IPs para banir, usar a lista do cache
+	if len(ipsParaBanir) == 0 && len(bannedIPsCache) > 0 {
+		fmt.Println("Nenhum novo IP para banir. Usando lista do cache...")
+		ipsParaBanir = bannedIPsCache
 	}
 
 	// Verificar se o ipset está instalado
@@ -434,7 +447,20 @@ func banirIPsMaliciosos() {
 	// Banir cada IP (sem duplicação - o ipset automaticamente evita duplicatas)
 	fmt.Printf("Banindo %d IPs maliciosos usando ipset...\n", len(ipsParaBanir))
 	for _, ip := range ipsParaBanir {
-		exec.Command("bash", "-c", fmt.Sprintf("ipset add mtm-banned-ips %s", ip)).Run()
+		// Verificar se o IP é válido
+		if net.ParseIP(ip) == nil {
+			fmt.Printf("IP inválido, ignorando: %s\n", ip)
+			continue
+		}
+		
+		// Adicionar o IP ao ipset e capturar qualquer erro
+		cmd := exec.Command("bash", "-c", fmt.Sprintf("ipset add mtm-banned-ips %s", ip))
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			fmt.Printf("Erro ao adicionar IP %s ao ipset: %v\n%s\n", ip, err, string(output))
+		} else {
+			fmt.Printf("IP %s adicionado ao ipset com sucesso\n", ip)
+		}
 	}
 
 	// Salvar o ipset para persistência
@@ -469,6 +495,64 @@ func banirIPsComIptables(ipsParaBanir []string) {
 
 	// Atualizar o cache para uso futuro
 	bannedIPsCache = ipsParaBanir
+}
+
+// testarBanimentoIPs adiciona alguns IPs de teste ao ipset para garantir que está funcionando
+func testarBanimentoIPs() {
+	fmt.Println("Adicionando IPs de teste ao ipset...")
+	
+	// Verificar se o ipset está instalado
+	checkIpsetCmd := exec.Command("bash", "-c", "command -v ipset || echo 'not-installed'")
+	ipsetOutput, _ := checkIpsetCmd.CombinedOutput()
+	if strings.Contains(string(ipsetOutput), "not-installed") {
+		fmt.Println("ipset não está instalado. Instalando...")
+		installCmd := exec.Command("bash", "-c", "apt-get update && apt-get install -y ipset")
+		installOutput, err := installCmd.CombinedOutput()
+		if err != nil {
+			fmt.Printf("Erro ao instalar ipset: %v\n%s\n", err, string(installOutput))
+			return
+		}
+	}
+	
+	// Criar o conjunto ipset se não existir
+	exec.Command("bash", "-c", "ipset create -exist mtm-banned-ips hash:ip").Run()
+	
+	// Garantir que a regra do iptables que usa o ipset exista
+	checkRuleCmd := exec.Command("bash", "-c", "iptables -C INPUT -m set --match-set mtm-banned-ips src -j DROP 2>/dev/null || echo 'not-exists'")
+	output, _ := checkRuleCmd.CombinedOutput()
+	if strings.Contains(string(output), "not-exists") {
+		exec.Command("bash", "-c", "iptables -A INPUT -m set --match-set mtm-banned-ips src -j DROP").Run()
+	}
+	
+	// Lista de IPs de teste para banir
+	ipsParaTestar := []string{
+		"1.2.3.4",
+		"5.6.7.8",
+		"9.10.11.12",
+		"13.14.15.16",
+		"17.18.19.20",
+	}
+	
+	// Adicionar os IPs de teste ao ipset
+	for _, ip := range ipsParaTestar {
+		cmd := exec.Command("bash", "-c", fmt.Sprintf("ipset add mtm-banned-ips %s", ip))
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			fmt.Printf("Erro ao adicionar IP de teste %s ao ipset: %v\n%s\n", ip, err, string(output))
+		} else {
+			fmt.Printf("IP de teste %s adicionado ao ipset com sucesso\n", ip)
+		}
+	}
+	
+	// Verificar se os IPs foram adicionados
+	listCmd := exec.Command("bash", "-c", "ipset list mtm-banned-ips")
+	listOutput, _ := listCmd.CombinedOutput()
+	fmt.Printf("Lista de IPs no ipset:\n%s\n", string(listOutput))
+	
+	// Verificar se a regra do iptables está funcionando
+	iptablesCmd := exec.Command("bash", "-c", "iptables -L INPUT -v -n | grep mtm-banned-ips")
+	iptablesOutput, _ := iptablesCmd.CombinedOutput()
+	fmt.Printf("Regra do iptables:\n%s\n", string(iptablesOutput))
 }
 
 // enviarStatusFirewall envia o status do firewall para a API
