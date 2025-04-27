@@ -54,7 +54,7 @@ git clone https://github.com/MakeToMe/agent.git .
 # Compilar o código
 echo "Compilando o código..."
 go mod tidy
-go build -o mtm_agent
+go build -o mtm-agent
 
 # Verificar se o arquivo de serviço existe
 echo "Configurando serviço systemd..."

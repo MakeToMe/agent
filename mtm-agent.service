@@ -6,7 +6,7 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=/opt/mtm_agent
-ExecStart=/opt/mtm_agent/mtm_agent
+ExecStart=/opt/mtm_agent/mtm-agent
 Restart=always
 RestartSec=10
 
