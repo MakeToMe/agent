@@ -270,6 +270,9 @@ func configurarFirewall(localIP string) error {
 		
 		firewallActive = true
 		firewallType = "iptables"
+		
+		// Enviar regras padrão para a API
+		enviarRegrasFirewallPadrao(localIP)
 	} else if firewallType == "ufw" {
 		// Se o UFW estiver ativo, garantir que as portas necessárias estejam abertas
 		fmt.Println("Configurando regras no UFW existente...")
@@ -319,39 +322,50 @@ func configurarFirewall(localIP string) error {
 	if err != nil {
 		fmt.Printf("Erro ao verificar Docker Swarm: %v\n", err)
 		// Continuar mesmo com erro
-	}
-
-	// Se for um Manager, liberar acesso dos Workers
-	if isManager && len(dockerWorkers) > 0 {
-		fmt.Println("Configurando regras de firewall para Workers do Docker Swarm...")
-		
-		for _, worker := range dockerWorkers {
-			// Liberar todo o tráfego dos Workers
-			switch firewallType {
-			case "ufw":
-				exec.Command("bash", "-c", fmt.Sprintf("ufw allow from %s comment 'Docker Swarm Worker: %s'", worker.IP, worker.Hostname)).Run()
-			case "firewalld":
-				exec.Command("bash", "-c", fmt.Sprintf("firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=%s accept'", worker.IP)).Run()
-				exec.Command("bash", "-c", "firewall-cmd --reload").Run()
-			case "iptables":
-				exec.Command("bash", "-c", fmt.Sprintf("iptables -A INPUT -s %s -j ACCEPT", worker.IP)).Run()
+	} else if isManager {
+		// Se for um Manager mas não tiver Workers, enviar regras padrão
+		if len(dockerWorkers) == 0 {
+			fmt.Println("VM é um Manager do Docker Swarm, mas não tem Workers. Enviando regras padrão...")
+			enviarRegrasFirewallPadrao(localIP)
+		} else {
+			// Se tiver Workers, liberar acesso deles
+			fmt.Println("Configurando regras de firewall para Workers do Docker Swarm...")
+			
+			for _, worker := range dockerWorkers {
+				// Liberar todo o tráfego dos Workers
+				switch firewallType {
+				case "ufw":
+					exec.Command("bash", "-c", fmt.Sprintf("ufw allow from %s comment 'Docker Swarm Worker: %s'", worker.IP, worker.Hostname)).Run()
+				case "firewalld":
+					exec.Command("bash", "-c", fmt.Sprintf("firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=%s accept'", worker.IP)).Run()
+					exec.Command("bash", "-c", "firewall-cmd --reload").Run()
+				case "iptables":
+					exec.Command("bash", "-c", fmt.Sprintf("iptables -A INPUT -s %s -j ACCEPT", worker.IP)).Run()
+				}
+				
+				// Enviar regra para a API
+				rule := FirewallRule{
+					IP:          localIP,
+					Port:        0, // 0 significa todas as portas
+					Protocol:    "all",
+					Action:      "allow",
+					Description: fmt.Sprintf("Docker Swarm Worker: %s", worker.Hostname),
+					Source:      worker.IP,
+					Active:      true,
+					Priority:    10,
+					FirewallType: firewallType,
+				}
+				
+				enviarRegraFirewall(rule)
 			}
 			
-			// Enviar regra para a API
-			rule := FirewallRule{
-				IP:          localIP,
-				Port:        0, // 0 significa todas as portas
-				Protocol:    "all",
-				Action:      "allow",
-				Description: fmt.Sprintf("Docker Swarm Worker: %s", worker.Hostname),
-				Source:      worker.IP,
-				Active:      true,
-				Priority:    10,
-				FirewallType: firewallType,
-			}
-			
-			enviarRegraFirewall(rule)
+			// Enviar também as regras padrão
+			enviarRegrasFirewallPadrao(localIP)
 		}
+	} else {
+		// Não é um Manager, enviar regras padrão
+		fmt.Println("VM não é um Manager do Docker Swarm. Enviando regras padrão...")
+		enviarRegrasFirewallPadrao(localIP)
 	}
 
 	// Banir IPs maliciosos
@@ -476,6 +490,48 @@ func enviarRegraFirewall(rule FirewallRule) {
 	}
 
 	fmt.Println("Regra de firewall enviada com sucesso!")
+}
+
+// enviarRegrasFirewallPadrao envia as regras padrão do firewall para a API
+func enviarRegrasFirewallPadrao(localIP string) {
+	// Lista de regras padrão a serem enviadas
+	regras := []struct {
+		Porta       int
+		Protocolo   string
+		Descricao   string
+		Prioridade  int
+	}{
+		{22, "tcp", "SSH - Acesso seguro remoto", 100},
+		{80, "tcp", "HTTP - Tráfego web não criptografado", 90},
+		{443, "tcp", "HTTPS - Tráfego web criptografado", 90},
+		{9001, "tcp", "API Local MTM Agent", 80},
+		{8080, "tcp", "Traefik Dashboard", 70},
+		{9000, "tcp", "Portainer - Gerenciamento de contêineres", 70},
+		{2377, "tcp", "Docker Swarm - Gerenciamento do cluster", 60},
+		{7946, "tcp", "Docker Swarm - Comunicação entre nós (TCP)", 60},
+		{7946, "udp", "Docker Swarm - Comunicação entre nós (UDP)", 60},
+		{4789, "udp", "Docker Swarm - Tráfego overlay", 60},
+	}
+
+	// Enviar cada regra para a API
+	fmt.Println("Enviando regras padrão de firewall para a API...")
+	for _, r := range regras {
+		rule := FirewallRule{
+			IP:          localIP,
+			Port:        r.Porta,
+			Protocol:    r.Protocolo,
+			Action:      "allow",
+			Description: r.Descricao,
+			Source:      "0.0.0.0/0", // Qualquer origem
+			Active:      true,
+			Priority:    r.Prioridade,
+			FirewallType: firewallType,
+		}
+		
+		enviarRegraFirewall(rule)
+	}
+
+	fmt.Println("Todas as regras padrão foram enviadas!")
 }
 
 
