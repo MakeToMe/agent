@@ -72,7 +72,7 @@ func main() {
 	}
 	fmt.Printf("IP local detectado: %s\n", localIP)
 
-	// Iniciar servidor HTTP para endpoints locais
+	// Iniciar servidor HTTP para endpoints locais na porta 9001 (evitando conflito com Portainer)
 	go startHTTPServer()
 
 	// No primeiro ciclo, configurar o firewall
@@ -255,8 +255,12 @@ func configurarFirewall(localIP string) error {
 		// Permitir HTTPS (porta 443)
 		exec.Command("bash", "-c", "iptables -A INPUT -p tcp --dport 443 -j ACCEPT").Run()
 		
-		// Permitir porta da API local (porta 9000)
-		exec.Command("bash", "-c", "iptables -A INPUT -p tcp --dport 9000 -j ACCEPT").Run()
+		// Permitir porta da API local (porta 9001)
+		exec.Command("bash", "-c", "iptables -A INPUT -p tcp --dport 9001 -j ACCEPT").Run()
+		
+		// Permitir portas para Traefik e Portainer
+		exec.Command("bash", "-c", "iptables -A INPUT -p tcp --dport 8080 -j ACCEPT").Run()  // Traefik dashboard
+		exec.Command("bash", "-c", "iptables -A INPUT -p tcp --dport 9000 -j ACCEPT").Run()  // Portainer
 		
 		// Permitir portas do Docker Swarm
 		exec.Command("bash", "-c", "iptables -A INPUT -p tcp --dport 2377 -j ACCEPT").Run()  // Gerenciamento do cluster
@@ -274,7 +278,11 @@ func configurarFirewall(localIP string) error {
 		exec.Command("bash", "-c", "ufw allow 22/tcp comment 'SSH'").Run()
 		exec.Command("bash", "-c", "ufw allow 80/tcp comment 'HTTP'").Run()
 		exec.Command("bash", "-c", "ufw allow 443/tcp comment 'HTTPS'").Run()
-		exec.Command("bash", "-c", "ufw allow 9000/tcp comment 'API Local'").Run()
+		exec.Command("bash", "-c", "ufw allow 9001/tcp comment 'API Local'").Run()
+		
+		// Portas para Traefik e Portainer
+		exec.Command("bash", "-c", "ufw allow 8080/tcp comment 'Traefik Dashboard'").Run()
+		exec.Command("bash", "-c", "ufw allow 9000/tcp comment 'Portainer'").Run()
 		
 		// Portas Docker Swarm
 		exec.Command("bash", "-c", "ufw allow 2377/tcp comment 'Docker Swarm management'").Run()
@@ -290,6 +298,10 @@ func configurarFirewall(localIP string) error {
 		exec.Command("bash", "-c", "firewall-cmd --permanent --add-service=ssh").Run()
 		exec.Command("bash", "-c", "firewall-cmd --permanent --add-service=http").Run()
 		exec.Command("bash", "-c", "firewall-cmd --permanent --add-service=https").Run()
+		exec.Command("bash", "-c", "firewall-cmd --permanent --add-port=9001/tcp").Run()
+		
+		// Portas para Traefik e Portainer
+		exec.Command("bash", "-c", "firewall-cmd --permanent --add-port=8080/tcp").Run()
 		exec.Command("bash", "-c", "firewall-cmd --permanent --add-port=9000/tcp").Run()
 		
 		// Portas Docker Swarm
@@ -570,8 +582,8 @@ func startHTTPServer() {
 		})
 	})
 
-	fmt.Println("Servidor HTTP iniciado na porta 9000")
-	if err := http.ListenAndServe(":9000", nil); err != nil {
+	fmt.Println("Servidor HTTP iniciado na porta 9001")
+	if err := http.ListenAndServe(":9001", nil); err != nil {
 		log.Fatalf("Erro ao iniciar servidor HTTP: %v", err)
 	}
 }
