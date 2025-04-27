@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -29,19 +30,59 @@ type LoginFailure struct {
 	Count int
 }
 
-// Variável global para controlar se é o primeiro ciclo
+// FirewallStatus representa o status do firewall para envio à API
+type FirewallStatus struct {
+	IP           string `json:"ip"`
+	FirewallType string `json:"firewall_type"`
+	Active       bool   `json:"active"`
+}
+
+// FirewallRule representa uma regra de firewall para envio à API
+type FirewallRule struct {
+	IP          string `json:"ip"`
+	Port        int    `json:"port"`
+	Protocol    string `json:"protocol"`
+	Action      string `json:"action"`
+	Description string `json:"description"`
+	Source      string `json:"source"`
+	Active      bool   `json:"active"`
+	Priority    int    `json:"priority"`
+	FirewallType string `json:"firewall_type"`
+}
+
+// DockerWorker representa um nó worker do Docker Swarm
+type DockerWorker struct {
+	Hostname string
+	IP       string
+}
+
+// Variáveis globais
 var isFirstCycle = true
+var dockerWorkers []DockerWorker
+var firewallType string
+var firewallActive bool
+var bannedIPsCache []string
 
 func main() {
 	// Obter IP da VM
-	ip, err := getLocalIP()
+	localIP, err := getLocalIP()
 	if err != nil {
-		log.Fatalf("Erro ao obter IP local: %v", err)
+		fmt.Printf("Erro ao obter IP local: %v\n", err)
+		localIP = "127.0.0.1" // Fallback para localhost
 	}
-	fmt.Printf("IP local detectado: %s\n", ip)
+	fmt.Printf("IP local detectado: %s\n", localIP)
 
 	// Iniciar servidor HTTP para endpoints locais
 	go startHTTPServer()
+
+	// No primeiro ciclo, configurar o firewall
+	if isFirstCycle {
+		fmt.Println("Primeiro ciclo: configurando firewall...")
+		err := configurarFirewall(localIP)
+		if err != nil {
+			fmt.Printf("Erro ao configurar firewall: %v\n", err)
+		}
+	}
 
 	// Iniciar rotina para executar lastb e enviar lista de IPs banidos a cada 5 minutos
 	ticker := time.NewTicker(5 * time.Minute)
@@ -52,13 +93,19 @@ func main() {
 		if err != nil {
 			log.Printf("Erro ao obter logins falhos: %v\n", err)
 		} else {
-			sendBannedIPsList(ip, failedLogins)
+			sendBannedIPsList(localIP, failedLogins)
+			
+			// Se for o primeiro ciclo, banir os IPs maliciosos no firewall
+			if isFirstCycle && firewallActive {
+				banirIPsMaliciosos()
+			}
 		}
 		
 		// Marcar que o primeiro ciclo foi concluído
 		isFirstCycle = false
 		fmt.Println("Primeiro ciclo concluído. Próximos ciclos usarão filtro de tempo.")
 		
+		// Ciclos subsequentes
 		for range ticker.C {
 			fmt.Println("Ciclo subsequente: obtendo apenas IPs recentes...")
 			failedLogins, err := getFailedLogins(false) // false = ciclos subsequentes
@@ -66,7 +113,12 @@ func main() {
 				log.Printf("Erro ao obter logins falhos: %v\n", err)
 				continue
 			}
-			sendBannedIPsList(ip, failedLogins)
+			sendBannedIPsList(localIP, failedLogins)
+			
+			// Banir novos IPs maliciosos no firewall
+			if firewallActive {
+				banirIPsMaliciosos()
+			}
 		}
 	}()
 
@@ -74,16 +126,305 @@ func main() {
 	select {}
 }
 
-// detectarTipoFirewall é um placeholder para detectar o tipo real do firewall na VM
-func detectarTipoFirewall() string {
-	// TODO: implementar detecção real (ufw, iptables, firewalld, etc)
-	return "ufw"
+// detectarTipoFirewall detecta o tipo de firewall ativo na VM
+func detectarTipoFirewall() (string, bool) {
+	// Verificar UFW
+	cmdUfw := exec.Command("bash", "-c", "ufw status | grep -q 'Status: active' && echo 'active' || echo 'inactive'")
+	outputUfw, _ := cmdUfw.CombinedOutput()
+	if strings.TrimSpace(string(outputUfw)) == "active" {
+		fmt.Println("Firewall UFW detectado e ativo")
+		return "ufw", true
+	}
+
+	// Verificar Firewalld
+	cmdFirewalld := exec.Command("bash", "-c", "command -v firewall-cmd && firewall-cmd --state 2>/dev/null || echo 'not running'")
+	outputFirewalld, _ := cmdFirewalld.CombinedOutput()
+	if strings.TrimSpace(string(outputFirewalld)) == "running" {
+		fmt.Println("Firewall Firewalld detectado e ativo")
+		return "firewalld", true
+	}
+
+	// Verificar iptables
+	cmdIptables := exec.Command("bash", "-c", "iptables -L -n | grep -q 'Chain' && echo 'configured' || echo 'not configured'")
+	outputIptables, _ := cmdIptables.CombinedOutput()
+	if strings.TrimSpace(string(outputIptables)) == "configured" {
+		// Verificar se há regras além das padrões
+		cmdRules := exec.Command("bash", "-c", "iptables -L -n | grep -v '^Chain' | grep -v '^target' | grep -v '^$' | wc -l")
+		outputRules, _ := cmdRules.CombinedOutput()
+		rulesCount, _ := strconv.Atoi(strings.TrimSpace(string(outputRules)))
+		if rulesCount > 0 {
+			fmt.Println("Firewall iptables detectado e configurado")
+			return "iptables", true
+		}
+	}
+
+	// Nenhum firewall ativo detectado
+	fmt.Println("Nenhum firewall ativo detectado")
+	return "iptables", false
 }
 
-// PAUSA - Esta função será refatorada posteriormente
-// func registrarStatusFirewall() {
-// 	// Implementação futura
-// }
+// verificarDockerSwarm verifica se a VM é um Manager do Docker Swarm e obtém os IPs dos Workers
+func verificarDockerSwarm() (bool, error) {
+	// Verificar se o Docker está instalado
+	cmdDocker := exec.Command("bash", "-c", "command -v docker")
+	_, err := cmdDocker.CombinedOutput()
+	if err != nil {
+		fmt.Println("Docker não encontrado na VM")
+		return false, nil
+	}
+
+	// Verificar se é um Manager do Docker Swarm
+	cmdSwarm := exec.Command("bash", "-c", "docker info | grep -q 'Swarm: active' && echo 'active' || echo 'inactive'")
+	outputSwarm, _ := cmdSwarm.CombinedOutput()
+	if strings.TrimSpace(string(outputSwarm)) != "active" {
+		fmt.Println("Esta VM não é um Manager do Docker Swarm")
+		return false, nil
+	}
+
+	// Verificar se é um Leader
+	cmdLeader := exec.Command("bash", "-c", "docker node ls --format \"{{.ManagerStatus}}\" | grep -q 'Leader' && echo 'leader' || echo 'not leader'")
+	outputLeader, _ := cmdLeader.CombinedOutput()
+	if strings.TrimSpace(string(outputLeader)) != "leader" {
+		fmt.Println("Esta VM é um Manager do Docker Swarm, mas não é o Leader")
+		return false, nil
+	}
+
+	// Obter IPs dos Workers ativos
+	cmdWorkers := exec.Command("bash", "-c", "docker node ls --format \"{{.Hostname}} {{.Status}} {{.ManagerStatus}} {{.Availability}}\" | grep \"Active\" | grep -v \"Leader\" | awk '{print $1}' | xargs -I{} sh -c 'echo \"{} $(docker node inspect --format \"{{.Status.Addr}}\" {})\"'")
+	outputWorkers, err := cmdWorkers.CombinedOutput()
+	if err != nil {
+		fmt.Printf("Erro ao obter IPs dos Workers: %v\n", err)
+		return true, err
+	}
+
+	// Processar a saída para extrair os IPs dos Workers
+	dockerWorkers = []DockerWorker{}
+	lines := strings.Split(string(outputWorkers), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		parts := strings.Fields(line)
+		if len(parts) >= 2 {
+			hostname := parts[0]
+			ip := parts[1]
+			dockerWorkers = append(dockerWorkers, DockerWorker{Hostname: hostname, IP: ip})
+		}
+	}
+
+	fmt.Printf("Encontrados %d Workers do Docker Swarm\n", len(dockerWorkers))
+	for i, worker := range dockerWorkers {
+		fmt.Printf("Worker %d: %s (%s)\n", i+1, worker.Hostname, worker.IP)
+	}
+
+	return true, nil
+}
+
+// configurarFirewall configura o firewall com as regras necessárias
+func configurarFirewall(localIP string) error {
+	// Detectar tipo de firewall
+	var err error
+	firewallType, firewallActive = detectarTipoFirewall()
+
+	// Se não houver firewall ativo, ativar o iptables
+	if !firewallActive {
+		fmt.Println("Ativando firewall iptables...")
+		// Limpar regras existentes
+		exec.Command("bash", "-c", "iptables -F").Run()
+		exec.Command("bash", "-c", "iptables -X").Run()
+		
+		// Configurar políticas padrão
+		exec.Command("bash", "-c", "iptables -P INPUT DROP").Run()
+		exec.Command("bash", "-c", "iptables -P FORWARD DROP").Run()
+		exec.Command("bash", "-c", "iptables -P OUTPUT ACCEPT").Run()
+		
+		// Permitir conexões estabelecidas
+		exec.Command("bash", "-c", "iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT").Run()
+		
+		// Permitir loopback
+		exec.Command("bash", "-c", "iptables -A INPUT -i lo -j ACCEPT").Run()
+		
+		// Permitir SSH (porta 22)
+		exec.Command("bash", "-c", "iptables -A INPUT -p tcp --dport 22 -j ACCEPT").Run()
+		
+		// Permitir HTTP (porta 80)
+		exec.Command("bash", "-c", "iptables -A INPUT -p tcp --dport 80 -j ACCEPT").Run()
+		
+		// Permitir HTTPS (porta 443)
+		exec.Command("bash", "-c", "iptables -A INPUT -p tcp --dport 443 -j ACCEPT").Run()
+		
+		// Permitir porta da API local (porta 9000)
+		exec.Command("bash", "-c", "iptables -A INPUT -p tcp --dport 9000 -j ACCEPT").Run()
+		
+		firewallActive = true
+		firewallType = "iptables"
+	}
+
+	// Verificar se é um Manager do Docker Swarm
+	isManager, err := verificarDockerSwarm()
+	if err != nil {
+		fmt.Printf("Erro ao verificar Docker Swarm: %v\n", err)
+		// Continuar mesmo com erro
+	}
+
+	// Se for um Manager, liberar acesso dos Workers
+	if isManager && len(dockerWorkers) > 0 {
+		fmt.Println("Configurando regras de firewall para Workers do Docker Swarm...")
+		
+		for _, worker := range dockerWorkers {
+			// Liberar todo o tráfego dos Workers
+			switch firewallType {
+			case "ufw":
+				exec.Command("bash", "-c", fmt.Sprintf("ufw allow from %s comment 'Docker Swarm Worker: %s'", worker.IP, worker.Hostname)).Run()
+			case "firewalld":
+				exec.Command("bash", "-c", fmt.Sprintf("firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=%s accept'", worker.IP)).Run()
+				exec.Command("bash", "-c", "firewall-cmd --reload").Run()
+			case "iptables":
+				exec.Command("bash", "-c", fmt.Sprintf("iptables -A INPUT -s %s -j ACCEPT", worker.IP)).Run()
+			}
+			
+			// Enviar regra para a API
+			rule := FirewallRule{
+				IP:          localIP,
+				Port:        0, // 0 significa todas as portas
+				Protocol:    "all",
+				Action:      "allow",
+				Description: fmt.Sprintf("Docker Swarm Worker: %s", worker.Hostname),
+				Source:      worker.IP,
+				Active:      true,
+				Priority:    10,
+				FirewallType: firewallType,
+			}
+			
+			enviarRegraFirewall(rule)
+		}
+	}
+
+	// Banir IPs maliciosos
+	banirIPsMaliciosos()
+
+	// Enviar status do firewall para a API
+	status := FirewallStatus{
+		IP:           localIP,
+		FirewallType: firewallType,
+		Active:       firewallActive,
+	}
+	
+	enviarStatusFirewall(status)
+
+	return nil
+}
+
+// banirIPsMaliciosos aplica banimento perpétuo para os IPs maliciosos
+func banirIPsMaliciosos() {
+	// Obter a lista de IPs com falhas de login
+	failedLogins, err := getFailedLogins(isFirstCycle)
+	if err != nil {
+		fmt.Printf("Erro ao obter logins falhos: %v\n", err)
+		return
+	}
+
+	// Filtrar IPs com 3 ou mais falhas
+	var ipsParaBanir []string
+	for _, failure := range failedLogins {
+		if failure.Count >= 3 {
+			ipsParaBanir = append(ipsParaBanir, failure.IP)
+		}
+	}
+
+	// Limitar aos primeiros 5000 IPs para evitar sobrecarga
+	if len(ipsParaBanir) > 5000 {
+		ipsParaBanir = ipsParaBanir[:5000]
+	}
+
+	// Identificar novos IPs para banir (que não estão no cache)
+	var novosIPs []string
+	for _, ip := range ipsParaBanir {
+		jáBanido := false
+		for _, bannedIP := range bannedIPsCache {
+			if ip == bannedIP {
+				jáBanido = true
+				break
+			}
+		}
+		if !jáBanido {
+			novosIPs = append(novosIPs, ip)
+		}
+	}
+
+	// Atualizar o cache com todos os IPs banidos
+	bannedIPsCache = ipsParaBanir
+
+	// Banir apenas os novos IPs
+	if len(novosIPs) > 0 {
+		fmt.Printf("Banindo %d novos IPs maliciosos no firewall...\n", len(novosIPs))
+		for _, ip := range novosIPs {
+			switch firewallType {
+			case "ufw":
+				exec.Command("bash", "-c", fmt.Sprintf("ufw deny from %s comment 'IP malicioso'", ip)).Run()
+			case "firewalld":
+				exec.Command("bash", "-c", fmt.Sprintf("firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=%s drop'", ip)).Run()
+			case "iptables":
+				exec.Command("bash", "-c", fmt.Sprintf("iptables -A INPUT -s %s -j DROP", ip)).Run()
+			}
+		}
+
+		// Recarregar firewalld se necessário
+		if firewallType == "firewalld" {
+			exec.Command("bash", "-c", "firewall-cmd --reload").Run()
+		}
+	} else {
+		fmt.Println("Nenhum novo IP malicioso para banir no firewall")
+	}
+}
+
+// enviarStatusFirewall envia o status do firewall para a API
+func enviarStatusFirewall(status FirewallStatus) {
+	jsonData, err := json.Marshal(status)
+	if err != nil {
+		fmt.Printf("Erro ao serializar status do firewall: %v\n", err)
+		return
+	}
+
+	resp, err := http.Post("http://170.205.37.204:8081/firewall_status", "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		fmt.Printf("Erro ao enviar status do firewall: %v\n", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		fmt.Printf("Erro ao enviar status do firewall. Status: %d\n", resp.StatusCode)
+		return
+	}
+
+	fmt.Println("Status do firewall enviado com sucesso!")
+}
+
+// enviarRegraFirewall envia uma regra de firewall para a API
+func enviarRegraFirewall(rule FirewallRule) {
+	jsonData, err := json.Marshal(rule)
+	if err != nil {
+		fmt.Printf("Erro ao serializar regra de firewall: %v\n", err)
+		return
+	}
+
+	resp, err := http.Post("http://170.205.37.204:8081/firewall_rules", "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		fmt.Printf("Erro ao enviar regra de firewall: %v\n", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		fmt.Printf("Erro ao enviar regra de firewall. Status: %d\n", resp.StatusCode)
+		return
+	}
+
+	fmt.Println("Regra de firewall enviada com sucesso!")
+}
 
 
 // getLocalIP retorna o primeiro IP não-loopback encontrado na máquina
