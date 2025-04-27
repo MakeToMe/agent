@@ -258,8 +258,48 @@ func configurarFirewall(localIP string) error {
 		// Permitir porta da API local (porta 9000)
 		exec.Command("bash", "-c", "iptables -A INPUT -p tcp --dport 9000 -j ACCEPT").Run()
 		
+		// Permitir portas do Docker Swarm
+		exec.Command("bash", "-c", "iptables -A INPUT -p tcp --dport 2377 -j ACCEPT").Run()  // Gerenciamento do cluster
+		exec.Command("bash", "-c", "iptables -A INPUT -p tcp --dport 7946 -j ACCEPT").Run()  // Comunicação entre nós (TCP)
+		exec.Command("bash", "-c", "iptables -A INPUT -p udp --dport 7946 -j ACCEPT").Run()  // Comunicação entre nós (UDP)
+		exec.Command("bash", "-c", "iptables -A INPUT -p udp --dport 4789 -j ACCEPT").Run()  // Tráfego overlay
+		
 		firewallActive = true
 		firewallType = "iptables"
+	} else if firewallType == "ufw" {
+		// Se o UFW estiver ativo, garantir que as portas necessárias estejam abertas
+		fmt.Println("Configurando regras no UFW existente...")
+		
+		// Portas essenciais
+		exec.Command("bash", "-c", "ufw allow 22/tcp comment 'SSH'").Run()
+		exec.Command("bash", "-c", "ufw allow 80/tcp comment 'HTTP'").Run()
+		exec.Command("bash", "-c", "ufw allow 443/tcp comment 'HTTPS'").Run()
+		exec.Command("bash", "-c", "ufw allow 9000/tcp comment 'API Local'").Run()
+		
+		// Portas Docker Swarm
+		exec.Command("bash", "-c", "ufw allow 2377/tcp comment 'Docker Swarm management'").Run()
+		exec.Command("bash", "-c", "ufw allow 7946/tcp comment 'Docker Swarm node communication'").Run()
+		exec.Command("bash", "-c", "ufw allow 7946/udp comment 'Docker Swarm node communication'").Run()
+		exec.Command("bash", "-c", "ufw allow 4789/udp comment 'Docker Swarm overlay network traffic'").Run()
+		
+	} else if firewallType == "firewalld" {
+		// Se o Firewalld estiver ativo, garantir que as portas necessárias estejam abertas
+		fmt.Println("Configurando regras no Firewalld existente...")
+		
+		// Portas essenciais
+		exec.Command("bash", "-c", "firewall-cmd --permanent --add-service=ssh").Run()
+		exec.Command("bash", "-c", "firewall-cmd --permanent --add-service=http").Run()
+		exec.Command("bash", "-c", "firewall-cmd --permanent --add-service=https").Run()
+		exec.Command("bash", "-c", "firewall-cmd --permanent --add-port=9000/tcp").Run()
+		
+		// Portas Docker Swarm
+		exec.Command("bash", "-c", "firewall-cmd --permanent --add-port=2377/tcp").Run()
+		exec.Command("bash", "-c", "firewall-cmd --permanent --add-port=7946/tcp").Run()
+		exec.Command("bash", "-c", "firewall-cmd --permanent --add-port=7946/udp").Run()
+		exec.Command("bash", "-c", "firewall-cmd --permanent --add-port=4789/udp").Run()
+		
+		// Recarregar para aplicar as mudanças
+		exec.Command("bash", "-c", "firewall-cmd --reload").Run()
 	}
 
 	// Verificar se é um Manager do Docker Swarm
