@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"os/exec"
 	"sort"
 	"strconv"
@@ -22,11 +23,42 @@ type BanIP struct {
 }
 
 type BanList struct {
-	IP      string  `json:"ip"`
+	IP      string `json:"ip"`
 	BanList []BanIP `json:"ban_list"`
 }
 
-// LoginFailure representa uma falha de login com contagem
+type ProcessInfo struct {
+	PID        int     `json:"pid"`
+	User       string  `json:"user"`
+	CPUPercent float64 `json:"cpu_percent"`
+	RAMPercent float64 `json:"ram_percent"`
+	RssKB      int     `json:"rss_kb"`
+	Command    string  `json:"command"`
+	Rank       int     `json:"rank"`
+}
+
+type ServerInfo struct {
+	IP       string `json:"ip"`
+	Hostname string `json:"hostname"`
+}
+
+type ProcessMetricsAPI struct {
+	ServerInfo   ServerInfo     `json:"server_info"`
+	TopProcesses TopProcessList `json:"top_processes"`
+}
+
+type TopProcessList struct {
+	ByCPU []ProcessInfo `json:"by_cpu"`
+	ByRAM []ProcessInfo `json:"by_ram"`
+}
+
+type ProcessMetricsDB struct {
+	ServerIP      string          `json:"server_ip"`
+	Hostname      string          `json:"hostname"`
+	ProcessSource string          `json:"process_source"`
+	Processes     json.RawMessage `json:"processes"`
+}
+
 type LoginFailure struct {
 	IP    string
 	Count int
@@ -126,6 +158,9 @@ func main() {
 			}
 		}
 	}()
+
+	// Iniciar rotina para coletar e enviar métricas de processos a cada 10 segundos
+	go coletarEEnviarMetricasProcessos(localIP)
 
 	// Manter o programa em execução
 	select {}
@@ -1251,6 +1286,133 @@ func getFailedLogins(isFirstRun bool) ([]LoginFailure, error) {
 	}
 
 	return failures, nil
+}
+
+// coletarEEnviarMetricasProcessos coleta e envia métricas de processos a cada 10 segundos
+func coletarEEnviarMetricasProcessos(localIP string) {
+	// Executar a cada 10 segundos
+	ticker := time.NewTicker(10 * time.Second)
+	
+	for range ticker.C {
+		// Obter hostname do servidor
+		hostname, err := os.Hostname()
+		if err != nil {
+			fmt.Printf("Erro ao obter hostname: %v\n", err)
+			hostname = "unknown"
+		}
+		
+		// Criar objeto de informações do servidor
+		serverInfo := ServerInfo{
+			IP:       localIP,
+			Hostname: hostname,
+		}
+		
+		// Coletar top processos por CPU
+		cmdCPU := exec.Command("bash", "-c", "ps -eo pid,user,pcpu,pmem,rss,cmd --sort=-pcpu | head -n 21")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		cmdCPU = exec.CommandContext(ctx, "bash", "-c", "ps -eo pid,user,pcpu,pmem,rss,cmd --sort=-pcpu | head -n 21")
+		outputCPU, err := cmdCPU.CombinedOutput()
+		if err != nil {
+			fmt.Printf("Erro ao coletar estatísticas de CPU: %v\n", err)
+			continue
+		}
+		
+		// Coletar top processos por RAM
+		cmdRAM := exec.Command("bash", "-c", "ps -eo pid,user,pcpu,pmem,rss,cmd --sort=-pmem | head -n 21")
+		ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel2()
+		cmdRAM = exec.CommandContext(ctx2, "bash", "-c", "ps -eo pid,user,pcpu,pmem,rss,cmd --sort=-pmem | head -n 21")
+		outputRAM, err := cmdRAM.CombinedOutput()
+		if err != nil {
+			fmt.Printf("Erro ao coletar estatísticas de RAM: %v\n", err)
+			continue
+		}
+		
+		// Processar saídas
+		processosCPU := processarSaidaPS(string(outputCPU), "cpu")
+		processosRAM := processarSaidaPS(string(outputRAM), "ram")
+		
+		// Montar objeto final no formato esperado pela API
+		metricas := ProcessMetricsAPI{
+			ServerInfo: serverInfo,
+			TopProcesses: TopProcessList{
+				ByCPU: processosCPU,
+				ByRAM: processosRAM,
+			},
+		}
+		
+		// Serializar para JSON
+		jsonData, err := json.Marshal(metricas)
+		if err != nil {
+			fmt.Printf("Erro ao serializar métricas: %v\n", err)
+			continue
+		}
+		
+		// Enviar para a API
+		resp, err := http.Post("http://170.205.37.204:8081/process_metrics", 
+						  "application/json", 
+						  bytes.NewBuffer(jsonData))
+		if err != nil {
+			fmt.Printf("Erro ao enviar métricas de processos: %v\n", err)
+			continue
+		}
+		defer resp.Body.Close()
+		
+		// Verificar resposta
+		respBody, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusOK {
+			fmt.Printf("Erro ao enviar métricas de processos. Status: %d, Resposta: %s\n", 
+				resp.StatusCode, string(respBody))
+		} else {
+			fmt.Println("Métricas de processos enviadas com sucesso")
+		}
+	}
+}
+
+// processarSaidaPS processa a saída do comando ps
+func processarSaidaPS(saida string, tipo string) []ProcessInfo {
+	linhas := strings.Split(saida, "\n")
+	if len(linhas) < 2 {
+		return []ProcessInfo{}
+	}
+	
+	// Ignorar a primeira linha (cabeçalho)
+	var resultados []ProcessInfo
+	
+	for i := 1; i < len(linhas) && i <= 20; i++ { // Limitar a 20 processos
+		linha := strings.TrimSpace(linhas[i])
+		if linha == "" {
+			continue
+		}
+		
+		campos := strings.Fields(linha)
+		if len(campos) < 6 {
+			continue
+		}
+		
+		pid, _ := strconv.Atoi(campos[0])
+		cpuPercent, _ := strconv.ParseFloat(campos[2], 64)
+		ramPercent, _ := strconv.ParseFloat(campos[3], 64)
+		rssKB, _ := strconv.Atoi(campos[4])
+		
+		// Reconstruir o comando (pode conter espaços)
+		cmd := strings.Join(campos[5:], " ")
+		
+		processo := ProcessInfo{
+			PID:        pid,
+			User:       campos[1],
+			CPUPercent: cpuPercent,
+			RAMPercent: ramPercent,
+			RssKB:      rssKB,
+			Command:    cmd,
+			Rank:       i, // Posição no ranking
+		}
+		
+		resultados = append(resultados, processo)
+	}
+	
+	return resultados
 }
 
 // sendBannedIPsList envia a lista de IPs banidos para a API externa
