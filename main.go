@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -1176,20 +1177,41 @@ func getFailedLogins(isFirstRun bool) ([]LoginFailure, error) {
 			"lastb -i | grep -o -E '\\b([0-9]{1,3}\\.){3}[0-9]{1,3}\\b' | sort | uniq -c | sort -nr")
 	} else {
 		// Ciclos subsequentes: obter apenas IPs dos últimos 8 minutos
-		// O lastb não tem uma opção direta para filtrar por tempo, então usamos o comando
-		// 'awk' para filtrar com base no timestamp das entradas
+		// Usar uma abordagem mais eficiente com grep para filtrar por data
 		fmt.Println("Executando comando para obter falhas de login dos últimos 8 minutos...")
+		
+		// Obter o timestamp de 8 minutos atrás no formato que o lastb usa
+		timeCmd := exec.Command("bash", "-c", "date -d '8 minutes ago' '+%b %d %H:%M'")
+		timeOutput, err := timeCmd.Output()
+		if err != nil {
+			return nil, fmt.Errorf("erro ao obter timestamp: %v", err)
+		}
+		timeThreshold := strings.TrimSpace(string(timeOutput))
+		
+		// Usar grep para filtrar por data antes de extrair IPs
 		cmd = exec.Command("bash", "-c", 
-			"TIME_THRESHOLD=$(date -d '8 minutes ago' '+%s') && " +
-			"lastb -i | awk -v threshold=$TIME_THRESHOLD '{cmd=\"date -d \"$4\" \"$5\" \"$6\" \"$7\" \"$8\" +%s\"; cmd | getline ts; close(cmd); if (ts >= threshold) print}' | " +
-			"grep -o -E '\\b([0-9]{1,3}\\.){3}[0-9]{1,3}\\b' | sort | uniq -c | sort -nr")
+			fmt.Sprintf("lastb -i | grep -A1000 \"%s\" | grep -o -E '\\b([0-9]{1,3}\\.){3}[0-9]{1,3}\\b' | sort | uniq -c | sort -nr", 
+			timeThreshold))
 	}
 	
-	output, err := cmd.CombinedOutput()
-
+	// Adicionar timeout para garantir que o comando não fique rodando indefinidamente
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	
+	// Criar um novo comando com o contexto de timeout
+	cmdWithContext := exec.CommandContext(ctx, "bash", "-c", cmd.Args[2])
+	
+	output, err := cmdWithContext.CombinedOutput()
+	
 	if err != nil {
-		// Verificamos se temos alguma saída antes de retornar erro
-		if len(output) == 0 {
+		// Verificar se o erro é devido ao timeout
+		if ctx.Err() == context.DeadlineExceeded {
+			fmt.Println("Comando cancelado por timeout após 30 segundos")
+			// Retornar dados parciais se disponíveis
+			if len(output) == 0 {
+				return nil, fmt.Errorf("comando cancelado por timeout sem saída")
+			}
+		} else if len(output) == 0 {
 			return nil, fmt.Errorf("erro ao executar comando de agregação de IPs: %v", err)
 		}
 	}
@@ -1229,8 +1251,6 @@ func getFailedLogins(isFirstRun bool) ([]LoginFailure, error) {
 	}
 
 	return failures, nil
-
-
 }
 
 // sendBannedIPsList envia a lista de IPs banidos para a API externa
