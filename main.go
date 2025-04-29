@@ -72,11 +72,10 @@ type SystemMetrics struct {
 }
 
 type ProcessMetricsDB struct {
-	ServerIP      string          `json:"server_ip"`
-	Hostname      string          `json:"hostname"`
-	ProcessSource string          `json:"process_source"`
-	Processes     json.RawMessage `json:"processes"`
-	SystemMetrics SystemMetrics   `json:"system_metrics"`
+	ServerIP      string        `json:"server_ip"`
+	Hostname      string        `json:"hostname"`
+	TopProcesses  TopProcessList `json:"top_processes"`
+	SystemMetrics SystemMetrics `json:"system_metrics"`
 }
 
 type LoginFailure struct {
@@ -1392,22 +1391,32 @@ func coletarEEnviarMetricasProcessos(localIP string) {
 			fmt.Printf("  Core %d: %.2f%%\n", core.Core, core.Usage)
 		}
 		
-		// Serializar para JSON
-		jsonData, err := json.Marshal(metricas)
+		// Não precisamos mais serializar as métricas originais, pois agora usamos o objeto unificado
+		
+		// Criar objeto unificado para enviar ao banco de dados
+		metricasDB := ProcessMetricsDB{
+			ServerIP:      serverInfo.IP,
+			Hostname:      serverInfo.Hostname,
+			TopProcesses:  metricas.TopProcesses,
+			SystemMetrics: metricas.SystemMetrics,
+		}
+		
+		// Serializar para JSON o objeto unificado
+		jsonDataDB, err := json.Marshal(metricasDB)
 		if err != nil {
-			fmt.Printf("Erro ao serializar métricas: %v\n", err)
+			fmt.Printf("Erro ao serializar métricas para DB: %v\n", err)
 			continue
 		}
 		
 		// Imprimir JSON para debug (remover em produção)
-		// fmt.Printf("JSON enviado: %s\n", string(jsonData))
+		// fmt.Printf("JSON enviado: %s\n", string(jsonDataDB))
 		
-		// Enviar para a API
+		// Enviar para a API (uma única linha com todos os dados)
 		resp, err := http.Post("http://170.205.37.204:8081/process_metrics", 
 						  "application/json", 
-						  bytes.NewBuffer(jsonData))
+						  bytes.NewBuffer(jsonDataDB))
 		if err != nil {
-			fmt.Printf("Erro ao enviar métricas de processos: %v\n", err)
+			fmt.Printf("Erro ao enviar métricas unificadas: %v\n", err)
 			continue
 		}
 		defer resp.Body.Close()
@@ -1415,10 +1424,10 @@ func coletarEEnviarMetricasProcessos(localIP string) {
 		// Verificar resposta
 		respBody, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode != http.StatusOK {
-			fmt.Printf("Erro ao enviar métricas de processos. Status: %d, Resposta: %s\n", 
+			fmt.Printf("Erro ao enviar métricas unificadas. Status: %d, Resposta: %s\n", 
 				resp.StatusCode, string(respBody))
 		} else {
-			fmt.Println("Métricas de processos e sistema enviadas com sucesso")
+			fmt.Println("Métricas unificadas enviadas com sucesso")
 		}
 	}
 }
