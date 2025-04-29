@@ -45,6 +45,7 @@ type ServerInfo struct {
 type ProcessMetricsAPI struct {
 	ServerInfo   ServerInfo     `json:"server_info"`
 	TopProcesses TopProcessList `json:"top_processes"`
+	SystemMetrics SystemMetrics `json:"system_metrics"`
 }
 
 type TopProcessList struct {
@@ -52,11 +53,30 @@ type TopProcessList struct {
 	ByRAM []ProcessInfo `json:"by_ram"`
 }
 
+type CPUCore struct {
+	Core  int     `json:"core"`
+	Usage float64 `json:"usage"`
+}
+
+type SystemMetrics struct {
+	CPUCores   []CPUCore `json:"cpu_cores"`
+	CPUTotal   float64   `json:"cpu_total"`
+	CPUUsada   float64   `json:"cpu_usada"`
+	CPULivre   float64   `json:"cpu_livre"`
+	MemTotal   float64   `json:"mem_total"`
+	MemUsada   float64   `json:"mem_usada"`
+	MemLivre   float64   `json:"mem_livre"`
+	DiscoTotal float64   `json:"disco_total"`
+	DiscoUsado float64   `json:"disco_usado"`
+	DiscoLivre float64   `json:"disco_livre"`
+}
+
 type ProcessMetricsDB struct {
 	ServerIP      string          `json:"server_ip"`
 	Hostname      string          `json:"hostname"`
 	ProcessSource string          `json:"process_source"`
 	Processes     json.RawMessage `json:"processes"`
+	SystemMetrics SystemMetrics   `json:"system_metrics"`
 }
 
 type LoginFailure struct {
@@ -1333,6 +1353,14 @@ func coletarEEnviarMetricasProcessos(localIP string) {
 		processosCPU := processarSaidaPS(string(outputCPU), "cpu")
 		processosRAM := processarSaidaPS(string(outputRAM), "ram")
 		
+		// Coletar métricas do sistema (CPU, memória, disco)
+		systemMetrics, err := coletarMetricasSistema()
+		if err != nil {
+			fmt.Printf("Erro ao coletar métricas do sistema: %v\n", err)
+			// Continuar mesmo com erro, usando uma estrutura vazia
+			systemMetrics = SystemMetrics{}
+		}
+		
 		// Montar objeto final no formato esperado pela API
 		metricas := ProcessMetricsAPI{
 			ServerInfo: serverInfo,
@@ -1340,6 +1368,7 @@ func coletarEEnviarMetricasProcessos(localIP string) {
 				ByCPU: processosCPU,
 				ByRAM: processosRAM,
 			},
+			SystemMetrics: systemMetrics,
 		}
 		
 		// Serializar para JSON
@@ -1348,6 +1377,9 @@ func coletarEEnviarMetricasProcessos(localIP string) {
 			fmt.Printf("Erro ao serializar métricas: %v\n", err)
 			continue
 		}
+		
+		// Imprimir JSON para debug (remover em produção)
+		// fmt.Printf("JSON enviado: %s\n", string(jsonData))
 		
 		// Enviar para a API
 		resp, err := http.Post("http://170.205.37.204:8081/process_metrics", 
@@ -1365,7 +1397,7 @@ func coletarEEnviarMetricasProcessos(localIP string) {
 			fmt.Printf("Erro ao enviar métricas de processos. Status: %d, Resposta: %s\n", 
 				resp.StatusCode, string(respBody))
 		} else {
-			fmt.Println("Métricas de processos enviadas com sucesso")
+			fmt.Println("Métricas de processos e sistema enviadas com sucesso")
 		}
 	}
 }
@@ -1413,6 +1445,241 @@ func processarSaidaPS(saida string, tipo string) []ProcessInfo {
 	}
 	
 	return resultados
+}
+
+// coletarMetricasCPU coleta métricas de CPU do sistema
+func coletarMetricasCPU() (SystemMetrics, error) {
+	var metrics SystemMetrics
+	
+	// Executar o comando mpstat para obter uso de CPU por core
+	cmdCPU := exec.Command("bash", "-c", "mpstat -P ALL 1 1 | grep -v Average | grep -v Linux | grep -v CPU")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmdCPU = exec.CommandContext(ctx, "bash", "-c", "mpstat -P ALL 1 1 | grep -v Average | grep -v Linux | grep -v CPU")
+	outputCPU, err := cmdCPU.CombinedOutput()
+	if err != nil {
+		// Tentar alternativa com /proc/stat se mpstat falhar
+		return coletarMetricasCPUAlternativa()
+	}
+	
+	// Processar saída do mpstat
+	linhas := strings.Split(string(outputCPU), "\n")
+	var cpuCores []CPUCore
+	var cpuTotal float64
+	
+	for i, linha := range linhas {
+		linha = strings.TrimSpace(linha)
+		if linha == "" {
+			continue
+		}
+		
+		campos := strings.Fields(linha)
+		if len(campos) < 12 {
+			continue
+		}
+		
+		// O campo idle é geralmente o 12º campo (index 11)
+		idle, err := strconv.ParseFloat(campos[11], 64)
+		if err != nil {
+			continue
+		}
+		
+		// Uso da CPU = 100 - idle
+		usage := 100.0 - idle
+		
+		// O primeiro é o total (ALL), os demais são os cores
+		if i == 0 {
+			cpuTotal = usage
+		} else {
+			cpuCores = append(cpuCores, CPUCore{
+				Core:  i - 1, // Ajustar índice para começar em 0
+				Usage: usage,
+			})
+		}
+	}
+	
+	metrics.CPUCores = cpuCores
+	metrics.CPUTotal = 100.0 // Capacidade total sempre é 100%
+	metrics.CPUUsada = cpuTotal
+	metrics.CPULivre = 100.0 - cpuTotal
+	
+	return metrics, nil
+}
+
+// coletarMetricasCPUAlternativa coleta métricas de CPU usando /proc/stat
+func coletarMetricasCPUAlternativa() (SystemMetrics, error) {
+	var metrics SystemMetrics
+	
+	// Ler /proc/stat para obter informações de CPU
+	conteudo, err := os.ReadFile("/proc/stat")
+	if err != nil {
+		return metrics, fmt.Errorf("erro ao ler /proc/stat: %v", err)
+	}
+	
+	linhas := strings.Split(string(conteudo), "\n")
+	var cpuCores []CPUCore
+	var cpuTotal float64
+	
+	// Primeira linha é o total da CPU
+	for i, linha := range linhas {
+		if !strings.HasPrefix(linha, "cpu") {
+			continue
+		}
+		
+		campos := strings.Fields(linha)
+		if len(campos) < 8 {
+			continue
+		}
+		
+		// Calcular uso da CPU
+		// user + nice + system + irq + softirq + steal
+		user, _ := strconv.ParseFloat(campos[1], 64)
+		nice, _ := strconv.ParseFloat(campos[2], 64)
+		system, _ := strconv.ParseFloat(campos[3], 64)
+		idle, _ := strconv.ParseFloat(campos[4], 64)
+		iowait, _ := strconv.ParseFloat(campos[5], 64)
+		irq, _ := strconv.ParseFloat(campos[6], 64)
+		softirq, _ := strconv.ParseFloat(campos[7], 64)
+		steal := 0.0
+		if len(campos) > 8 {
+			steal, _ = strconv.ParseFloat(campos[8], 64)
+		}
+		
+		total := user + nice + system + idle + iowait + irq + softirq + steal
+		used := user + nice + system + irq + softirq + steal
+		usage := (used / total) * 100.0
+		
+		if campos[0] == "cpu" {
+			// Total de todas as CPUs
+			cpuTotal = usage
+		} else if strings.HasPrefix(campos[0], "cpu") {
+			// Core específico (cpu0, cpu1, etc.)
+			coreID, err := strconv.Atoi(strings.TrimPrefix(campos[0], "cpu"))
+			if err == nil {
+				cpuCores = append(cpuCores, CPUCore{
+					Core:  coreID,
+					Usage: usage,
+				})
+			}
+		}
+		
+		// Limitar a 32 cores para evitar problemas
+		if i > 32 {
+			break
+		}
+	}
+	
+	metrics.CPUCores = cpuCores
+	metrics.CPUTotal = 100.0 // Capacidade total sempre é 100%
+	metrics.CPUUsada = cpuTotal
+	metrics.CPULivre = 100.0 - cpuTotal
+	
+	return metrics, nil
+}
+
+// coletarMetricasMemoria coleta métricas de memória do sistema
+func coletarMetricasMemoria() (SystemMetrics, error) {
+	var metrics SystemMetrics
+	
+	// Executar o comando free para obter informações de memória
+	cmdMem := exec.Command("bash", "-c", "free -m | grep Mem")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmdMem = exec.CommandContext(ctx, "bash", "-c", "free -m | grep Mem")
+	outputMem, err := cmdMem.CombinedOutput()
+	if err != nil {
+		return metrics, fmt.Errorf("erro ao executar free: %v", err)
+	}
+	
+	// Processar saída do free
+	campos := strings.Fields(string(outputMem))
+	if len(campos) < 7 {
+		return metrics, fmt.Errorf("formato inesperado na saída do free")
+	}
+	
+	// Campos: "Mem:", total, used, free, shared, buff/cache, available
+	total, _ := strconv.ParseFloat(campos[1], 64)
+	usada, _ := strconv.ParseFloat(campos[2], 64)
+	livre, _ := strconv.ParseFloat(campos[3], 64)
+	
+	metrics.MemTotal = total
+	metrics.MemUsada = usada
+	metrics.MemLivre = livre
+	
+	return metrics, nil
+}
+
+// coletarMetricasDisco coleta métricas de disco do sistema
+func coletarMetricasDisco() (SystemMetrics, error) {
+	var metrics SystemMetrics
+	
+	// Executar o comando df para obter informações de disco
+	cmdDisk := exec.Command("bash", "-c", "df -m / | tail -1")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmdDisk = exec.CommandContext(ctx, "bash", "-c", "df -m / | tail -1")
+	outputDisk, err := cmdDisk.CombinedOutput()
+	if err != nil {
+		return metrics, fmt.Errorf("erro ao executar df: %v", err)
+	}
+	
+	// Processar saída do df
+	campos := strings.Fields(string(outputDisk))
+	if len(campos) < 6 {
+		return metrics, fmt.Errorf("formato inesperado na saída do df")
+	}
+	
+	// Campos: filesystem, 1K-blocks, used, available, use%, mounted-on
+	total, _ := strconv.ParseFloat(campos[1], 64)
+	usado, _ := strconv.ParseFloat(campos[2], 64)
+	livre, _ := strconv.ParseFloat(campos[3], 64)
+	
+	metrics.DiscoTotal = total
+	metrics.DiscoUsado = usado
+	metrics.DiscoLivre = livre
+	
+	return metrics, nil
+}
+
+// coletarMetricasSistema coleta todas as métricas do sistema
+func coletarMetricasSistema() (SystemMetrics, error) {
+	var metrics SystemMetrics
+	
+	// Coletar métricas de CPU
+	cpuMetrics, err := coletarMetricasCPU()
+	if err != nil {
+		fmt.Printf("Erro ao coletar métricas de CPU: %v\n", err)
+		// Continuar mesmo com erro
+	} else {
+		metrics.CPUCores = cpuMetrics.CPUCores
+		metrics.CPUTotal = cpuMetrics.CPUTotal
+		metrics.CPUUsada = cpuMetrics.CPUUsada
+		metrics.CPULivre = cpuMetrics.CPULivre
+	}
+	
+	// Coletar métricas de memória
+	memMetrics, err := coletarMetricasMemoria()
+	if err != nil {
+		fmt.Printf("Erro ao coletar métricas de memória: %v\n", err)
+		// Continuar mesmo com erro
+	} else {
+		metrics.MemTotal = memMetrics.MemTotal
+		metrics.MemUsada = memMetrics.MemUsada
+		metrics.MemLivre = memMetrics.MemLivre
+	}
+	
+	// Coletar métricas de disco
+	diskMetrics, err := coletarMetricasDisco()
+	if err != nil {
+		fmt.Printf("Erro ao coletar métricas de disco: %v\n", err)
+		// Continuar mesmo com erro
+	} else {
+		metrics.DiscoTotal = diskMetrics.DiscoTotal
+		metrics.DiscoUsado = diskMetrics.DiscoUsado
+		metrics.DiscoLivre = diskMetrics.DiscoLivre
+	}
+	
+	return metrics, nil
 }
 
 // sendBannedIPsList envia a lista de IPs banidos para a API externa
