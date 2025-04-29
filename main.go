@@ -1509,20 +1509,20 @@ func coletarMetricasCPU() (SystemMetrics, error) {
 		
 		// Verificar se é uma linha de core ou total
 		coreID := -1
-		if campos[2] == "all" || campos[2] == "ALL" {
+		if campos[1] == "all" || campos[1] == "ALL" {
 			// Esta é a linha de total
 			coreID = -1
 		} else {
 			// Tentar extrair o ID do core
-			id, err := strconv.Atoi(campos[2])
+			id, err := strconv.Atoi(campos[1])
 			if err != nil {
 				continue
 			}
 			coreID = id
 		}
 		
-		// O campo idle é geralmente o 12º campo (index 11)
-		idle, err := strconv.ParseFloat(campos[11], 64)
+		// O campo idle é o 11º campo (index 10) na saída do mpstat
+		idle, err := strconv.ParseFloat(campos[10], 64)
 		if err != nil {
 			continue
 		}
