@@ -1468,9 +1468,23 @@ func processarSaidaPS(saida string, tipo string) []ProcessInfo {
 	return resultados
 }
 
-// coletarMetricasCPU coleta métricas de CPU do sistema
+// coletarMetricasCPU coleta métricas de CPU do sistema usando /proc/stat
 func coletarMetricasCPU() (SystemMetrics, error) {
 	var metrics SystemMetrics
+	
+	// Ler /proc/stat para obter informações de CPU por núcleo
+	conteudo, err := os.ReadFile("/proc/stat")
+	if err != nil {
+		return metrics, fmt.Errorf("erro ao ler /proc/stat: %v", err)
+	}
+	
+	linhas := strings.Split(string(conteudo), "\n")
+	var cpuCores []CPUCore
+	var cpuTotal float64
+	var totalCPULinha string
+	
+	// Mapa para rastrear quais cores já foram processados
+	coresProcessados := make(map[int]bool)
 	
 	// Primeiro, vamos verificar o número real de cores usando nproc
 	cmdNproc := exec.Command("bash", "-c", "nproc")
@@ -1488,77 +1502,103 @@ func coletarMetricasCPU() (SystemMetrics, error) {
 		}
 	}
 	
-	// Executar o comando mpstat para obter uso de CPU por core
-	cmdCPU := exec.Command("bash", "-c", "mpstat -P ALL 1 1 | grep -v Average | grep -v Linux | grep -v CPU")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	cmdCPU = exec.CommandContext(ctx, "bash", "-c", "mpstat -P ALL 1 1 | grep -v Average | grep -v Linux | grep -v CPU")
-	outputCPU, err := cmdCPU.CombinedOutput()
-	if err != nil {
-		// Tentar alternativa com /proc/stat se mpstat falhar
-		return coletarMetricasCPUAlternativa(numCores)
-	}
-	
-	// Processar saída do mpstat
-	linhas := strings.Split(string(outputCPU), "\n")
-	var cpuCores []CPUCore
-	var cpuTotal float64
-	
-	// Mapa para rastrear quais cores já foram processados
-	coresProcessados := make(map[int]bool)
-	
+	// Processar linhas do /proc/stat
 	for _, linha := range linhas {
 		linha = strings.TrimSpace(linha)
-		if linha == "" {
+		if !strings.HasPrefix(linha, "cpu") {
 			continue
 		}
 		
 		campos := strings.Fields(linha)
-		if len(campos) < 12 {
+		if len(campos) < 8 {
 			continue
 		}
 		
-		// Verificar se é uma linha de core ou total
-		coreID := -1
-		if campos[1] == "all" || campos[1] == "ALL" {
-			// Esta é a linha de total
-			coreID = -1
-		} else {
-			// Tentar extrair o ID do core
-			id, err := strconv.Atoi(campos[1])
-			if err != nil {
-				continue
-			}
-			coreID = id
+		// Extrair o ID do core do nome (ex: cpu0 -> 0)
+		cpuName := campos[0]
+		if cpuName == "cpu" {
+			// Guardar a linha de CPU total para processar depois
+			totalCPULinha = linha
+			continue
 		}
 		
-		// O campo idle é o 11º campo (index 10) na saída do mpstat
-		idle, err := strconv.ParseFloat(campos[10], 64)
+		// Extrair o número do core do nome (ex: cpu0 -> 0)
+		cpuNumStr := strings.TrimPrefix(cpuName, "cpu")
+		coreID, err := strconv.Atoi(cpuNumStr)
 		if err != nil {
+			continue // Pular se não conseguir extrair o número
+		}
+		
+		// Verificar se o core está dentro do limite físico e não foi processado ainda
+		if coreID >= numCores || coresProcessados[coreID] {
 			continue
 		}
 		
-		// Uso da CPU = 100 - idle
-		// Garantir que o valor está entre 0 e 100
-		usage := 100.0 - idle
-		fmt.Printf("Core %d: idle=%.2f, usage=%.2f\n", coreID, idle, usage)
-		if usage < 0 {
-			usage = 0
-		} else if usage > 100 {
-			usage = 100
+		// Calcular uso de CPU baseado nos valores de /proc/stat
+		// Formato: cpu user nice system idle iowait irq softirq steal guest guest_nice
+		user, _ := strconv.ParseFloat(campos[1], 64)
+		nice, _ := strconv.ParseFloat(campos[2], 64)
+		system, _ := strconv.ParseFloat(campos[3], 64)
+		idle, _ := strconv.ParseFloat(campos[4], 64)
+		
+		// Calcular iowait se disponível
+		iowait := 0.0
+		if len(campos) >= 6 {
+			iowait, _ = strconv.ParseFloat(campos[5], 64)
 		}
 		
-		if coreID == -1 {
-			// Total de todas as CPUs
-			cpuTotal = usage
-		} else {
-			// Verificar se o core está dentro do limite físico
-			if coreID < numCores && !coresProcessados[coreID] {
-				cpuCores = append(cpuCores, CPUCore{
-					Core:  coreID,
-					Usage: usage,
-				})
-				coresProcessados[coreID] = true
+		// Total de tempo
+		total := user + nice + system + idle + iowait
+		if total > 0 {
+			// Calcular porcentagens
+			idlePercent := (idle / total) * 100
+			usedPercent := 100.0 - idlePercent
+			
+			// Garantir que o valor está entre 0 e 100
+			if usedPercent < 0 {
+				usedPercent = 0
+			} else if usedPercent > 100 {
+				usedPercent = 100
+			}
+			
+			fmt.Printf("Core %d: user=%.2f, nice=%.2f, system=%.2f, idle=%.2f, iowait=%.2f, total=%.2f, usage=%.2f%%\n", 
+				coreID, user, nice, system, idle, iowait, total, usedPercent)
+			
+			// Adicionar à lista de métricas por núcleo
+			cpuCores = append(cpuCores, CPUCore{
+				Core:  coreID,
+				Usage: usedPercent,
+			})
+			coresProcessados[coreID] = true
+		}
+	}
+	
+	// Processar a linha de CPU total
+	if totalCPULinha != "" {
+		campos := strings.Fields(totalCPULinha)
+		if len(campos) >= 8 {
+			user, _ := strconv.ParseFloat(campos[1], 64)
+			nice, _ := strconv.ParseFloat(campos[2], 64)
+			system, _ := strconv.ParseFloat(campos[3], 64)
+			idle, _ := strconv.ParseFloat(campos[4], 64)
+			iowait := 0.0
+			if len(campos) >= 6 {
+				iowait, _ = strconv.ParseFloat(campos[5], 64)
+			}
+			
+			total := user + nice + system + idle + iowait
+			if total > 0 {
+				idlePercent := (idle / total) * 100
+				cpuTotal = 100.0 - idlePercent
+				
+				// Garantir que o valor está entre 0 e 100
+				if cpuTotal < 0 {
+					cpuTotal = 0
+				} else if cpuTotal > 100 {
+					cpuTotal = 100
+				}
+				
+				fmt.Printf("CPU Total: usage=%.2f%%\n", cpuTotal)
 			}
 		}
 	}
@@ -1576,8 +1616,10 @@ func coletarMetricasCPU() (SystemMetrics, error) {
 	return metrics, nil
 }
 
-// coletarMetricasCPUAlternativa coleta métricas de CPU usando /proc/stat
+// coletarMetricasCPUAlternativa coleta métricas de CPU usando o comando top
 func coletarMetricasCPUAlternativa(numCores int) (SystemMetrics, error) {
+	// Como já estamos usando /proc/stat na função principal, esta alternativa 
+	// usa o comando top como backup
 	var metrics SystemMetrics
 	
 	// Se não temos o número de cores, tentar descobrir
@@ -1601,62 +1643,54 @@ func coletarMetricasCPUAlternativa(numCores int) (SystemMetrics, error) {
 		}
 	}
 	
-	// Ler /proc/stat para obter informações de CPU
-	conteudo, err := os.ReadFile("/proc/stat")
+	// Usar o comando top para obter uso de CPU
+	cmdTop := exec.Command("bash", "-c", "top -bn1 | grep '%Cpu'")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmdTop = exec.CommandContext(ctx, "bash", "-c", "top -bn1 | grep '%Cpu'")
+	outputTop, err := cmdTop.CombinedOutput()
 	if err != nil {
-		return metrics, fmt.Errorf("erro ao ler /proc/stat: %v", err)
+		return metrics, fmt.Errorf("erro ao executar top: %v", err)
 	}
 	
-	linhas := strings.Split(string(conteudo), "\n")
+	// Processar saída do top
+	linhas := strings.Split(string(outputTop), "\n")
 	var cpuCores []CPUCore
 	var cpuTotal float64
 	
-	// Mapa para rastrear quais cores já foram processados
-	coresProcessados := make(map[int]bool)
-	
-	// Processar linhas do /proc/stat
+	// Processar a saída do top para obter o uso total da CPU
 	for _, linha := range linhas {
-		if !strings.HasPrefix(linha, "cpu") {
+		linha = strings.TrimSpace(linha)
+		if linha == "" {
 			continue
 		}
 		
-		campos := strings.Fields(linha)
-		if len(campos) < 8 {
-			continue
-		}
-		
-		// Calcular uso da CPU
-		// user + nice + system + irq + softirq + steal
-		user, _ := strconv.ParseFloat(campos[1], 64)
-		nice, _ := strconv.ParseFloat(campos[2], 64)
-		system, _ := strconv.ParseFloat(campos[3], 64)
-		idle, _ := strconv.ParseFloat(campos[4], 64)
-		iowait, _ := strconv.ParseFloat(campos[5], 64)
-		irq, _ := strconv.ParseFloat(campos[6], 64)
-		softirq, _ := strconv.ParseFloat(campos[7], 64)
-		steal := 0.0
-		if len(campos) > 8 {
-			steal, _ = strconv.ParseFloat(campos[8], 64)
-		}
-		
-		total := user + nice + system + idle + iowait + irq + softirq + steal
-		used := user + nice + system + irq + softirq + steal
-		usage := (used / total) * 100.0
-		
-		if campos[0] == "cpu" {
-			// Total de todas as CPUs
-			cpuTotal = usage
-		} else if strings.HasPrefix(campos[0], "cpu") {
-			// Core específico (cpu0, cpu1, etc.)
-			coreID, err := strconv.Atoi(strings.TrimPrefix(campos[0], "cpu"))
-			if err == nil && coreID < numCores && !coresProcessados[coreID] {
-				cpuCores = append(cpuCores, CPUCore{
-					Core:  coreID,
-					Usage: usage,
-				})
-				coresProcessados[coreID] = true
+		// Exemplo de saída: "%Cpu(s):  5.9 us,  0.9 sy,  0.0 ni, 93.2 id,  0.0 wa,  0.0 hi,  0.0 si,  0.0 st"
+		if strings.Contains(linha, "%Cpu") {
+			// Extrair o valor de idle (id)
+			idleMatch := strings.Split(linha, "id")
+			if len(idleMatch) > 1 {
+				idleStr := strings.TrimSpace(strings.Split(idleMatch[0], " ")[len(strings.Split(idleMatch[0], " "))-1])
+				idle, err := strconv.ParseFloat(idleStr, 64)
+				if err == nil {
+					cpuTotal = 100.0 - idle
+					break
+				}
 			}
 		}
+	}
+	
+	// Criar cores artificiais com base no uso total
+	for i := 0; i < numCores; i++ {
+		cpuCores = append(cpuCores, CPUCore{
+			Core:  i,
+			Usage: cpuTotal, // Todos os cores têm o mesmo uso neste método alternativo
+		})
+	}
+	
+	fmt.Printf("CPU Total (alternativo): %.2f%%\n", cpuTotal)
+	for _, core := range cpuCores {
+		fmt.Printf("Core %d (alternativo): %.2f%%\n", core.Core, core.Usage)
 	}
 	
 	metrics.CPUCores = cpuCores
