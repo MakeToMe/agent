@@ -73,8 +73,13 @@ type SystemMetrics struct {
 
 type ProcessMetricsDB struct {
 	ServerInfo    ServerInfo     `json:"server_info"`
-	TopProcesses  TopProcessList `json:"top_processes"`
+	Processes     ProcessesList  `json:"processes"`
 	SystemMetrics SystemMetrics  `json:"system_metrics"`
+}
+
+type ProcessesList struct {
+	ByCPU []ProcessInfo `json:"by_cpu"`
+	ByRAM []ProcessInfo `json:"by_ram"`
 }
 
 type LoginFailure struct {
@@ -1395,7 +1400,10 @@ func coletarEEnviarMetricasProcessos(localIP string) {
 		// Criar objeto unificado para enviar ao banco de dados
 		metricasDB := ProcessMetricsDB{
 			ServerInfo:    serverInfo,
-			TopProcesses:  metricas.TopProcesses,
+			Processes:     ProcessesList{
+				ByCPU: processosCPU,
+				ByRAM: processosRAM,
+			},
 			SystemMetrics: metricas.SystemMetrics,
 		}
 		
