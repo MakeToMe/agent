@@ -1451,6 +1451,22 @@ func processarSaidaPS(saida string, tipo string) []ProcessInfo {
 func coletarMetricasCPU() (SystemMetrics, error) {
 	var metrics SystemMetrics
 	
+	// Primeiro, vamos verificar o número real de cores usando nproc
+	cmdNproc := exec.Command("bash", "-c", "nproc")
+	ctxNproc, cancelNproc := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancelNproc()
+	cmdNproc = exec.CommandContext(ctxNproc, "bash", "-c", "nproc")
+	outputNproc, err := cmdNproc.CombinedOutput()
+	
+	// Número de cores físicos
+	numCores := 1 // Valor padrão se não conseguir determinar
+	if err == nil {
+		n, err := strconv.Atoi(strings.TrimSpace(string(outputNproc)))
+		if err == nil && n > 0 {
+			numCores = n
+		}
+	}
+	
 	// Executar o comando mpstat para obter uso de CPU por core
 	cmdCPU := exec.Command("bash", "-c", "mpstat -P ALL 1 1 | grep -v Average | grep -v Linux | grep -v CPU")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -1459,7 +1475,7 @@ func coletarMetricasCPU() (SystemMetrics, error) {
 	outputCPU, err := cmdCPU.CombinedOutput()
 	if err != nil {
 		// Tentar alternativa com /proc/stat se mpstat falhar
-		return coletarMetricasCPUAlternativa()
+		return coletarMetricasCPUAlternativa(numCores)
 	}
 	
 	// Processar saída do mpstat
@@ -1467,7 +1483,10 @@ func coletarMetricasCPU() (SystemMetrics, error) {
 	var cpuCores []CPUCore
 	var cpuTotal float64
 	
-	for i, linha := range linhas {
+	// Mapa para rastrear quais cores já foram processados
+	coresProcessados := make(map[int]bool)
+	
+	for _, linha := range linhas {
 		linha = strings.TrimSpace(linha)
 		if linha == "" {
 			continue
@@ -1476,6 +1495,20 @@ func coletarMetricasCPU() (SystemMetrics, error) {
 		campos := strings.Fields(linha)
 		if len(campos) < 12 {
 			continue
+		}
+		
+		// Verificar se é uma linha de core ou total
+		coreID := -1
+		if campos[2] == "all" || campos[2] == "ALL" {
+			// Esta é a linha de total
+			coreID = -1
+		} else {
+			// Tentar extrair o ID do core
+			id, err := strconv.Atoi(campos[2])
+			if err != nil {
+				continue
+			}
+			coreID = id
 		}
 		
 		// O campo idle é geralmente o 12º campo (index 11)
@@ -1487,14 +1520,18 @@ func coletarMetricasCPU() (SystemMetrics, error) {
 		// Uso da CPU = 100 - idle
 		usage := 100.0 - idle
 		
-		// O primeiro é o total (ALL), os demais são os cores
-		if i == 0 {
+		if coreID == -1 {
+			// Total de todas as CPUs
 			cpuTotal = usage
 		} else {
-			cpuCores = append(cpuCores, CPUCore{
-				Core:  i - 1, // Ajustar índice para começar em 0
-				Usage: usage,
-			})
+			// Verificar se o core está dentro do limite físico
+			if coreID < numCores && !coresProcessados[coreID] {
+				cpuCores = append(cpuCores, CPUCore{
+					Core:  coreID,
+					Usage: usage,
+				})
+				coresProcessados[coreID] = true
+			}
 		}
 	}
 	
@@ -1503,12 +1540,38 @@ func coletarMetricasCPU() (SystemMetrics, error) {
 	metrics.CPUUsada = cpuTotal
 	metrics.CPULivre = 100.0 - cpuTotal
 	
+	// Ordenar os cores por ID para garantir a ordem correta
+	sort.Slice(metrics.CPUCores, func(i, j int) bool {
+		return metrics.CPUCores[i].Core < metrics.CPUCores[j].Core
+	})
+	
 	return metrics, nil
 }
 
 // coletarMetricasCPUAlternativa coleta métricas de CPU usando /proc/stat
-func coletarMetricasCPUAlternativa() (SystemMetrics, error) {
+func coletarMetricasCPUAlternativa(numCores int) (SystemMetrics, error) {
 	var metrics SystemMetrics
+	
+	// Se não temos o número de cores, tentar descobrir
+	if numCores <= 0 {
+		// Tentar obter o número de cores usando nproc
+		cmdNproc := exec.Command("bash", "-c", "nproc")
+		ctxNproc, cancelNproc := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancelNproc()
+		cmdNproc = exec.CommandContext(ctxNproc, "bash", "-c", "nproc")
+		outputNproc, err := cmdNproc.CombinedOutput()
+		
+		if err == nil {
+			n, err := strconv.Atoi(strings.TrimSpace(string(outputNproc)))
+			if err == nil && n > 0 {
+				numCores = n
+			} else {
+				numCores = 1 // Valor padrão se não conseguir determinar
+			}
+		} else {
+			numCores = 1 // Valor padrão se não conseguir determinar
+		}
+	}
 	
 	// Ler /proc/stat para obter informações de CPU
 	conteudo, err := os.ReadFile("/proc/stat")
@@ -1520,8 +1583,11 @@ func coletarMetricasCPUAlternativa() (SystemMetrics, error) {
 	var cpuCores []CPUCore
 	var cpuTotal float64
 	
-	// Primeira linha é o total da CPU
-	for i, linha := range linhas {
+	// Mapa para rastrear quais cores já foram processados
+	coresProcessados := make(map[int]bool)
+	
+	// Processar linhas do /proc/stat
+	for _, linha := range linhas {
 		if !strings.HasPrefix(linha, "cpu") {
 			continue
 		}
@@ -1555,17 +1621,13 @@ func coletarMetricasCPUAlternativa() (SystemMetrics, error) {
 		} else if strings.HasPrefix(campos[0], "cpu") {
 			// Core específico (cpu0, cpu1, etc.)
 			coreID, err := strconv.Atoi(strings.TrimPrefix(campos[0], "cpu"))
-			if err == nil {
+			if err == nil && coreID < numCores && !coresProcessados[coreID] {
 				cpuCores = append(cpuCores, CPUCore{
 					Core:  coreID,
 					Usage: usage,
 				})
+				coresProcessados[coreID] = true
 			}
-		}
-		
-		// Limitar a 32 cores para evitar problemas
-		if i > 32 {
-			break
 		}
 	}
 	
@@ -1573,6 +1635,11 @@ func coletarMetricasCPUAlternativa() (SystemMetrics, error) {
 	metrics.CPUTotal = 100.0 // Capacidade total sempre é 100%
 	metrics.CPUUsada = cpuTotal
 	metrics.CPULivre = 100.0 - cpuTotal
+	
+	// Ordenar os cores por ID para garantir a ordem correta
+	sort.Slice(metrics.CPUCores, func(i, j int) bool {
+		return metrics.CPUCores[i].Core < metrics.CPUCores[j].Core
+	})
 	
 	return metrics, nil
 }
