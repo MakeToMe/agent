@@ -1371,6 +1371,16 @@ func coletarEEnviarMetricasProcessos(localIP string) {
 			SystemMetrics: systemMetrics,
 		}
 		
+		// Verificar se temos dados de CPU cores para enviar
+		if len(systemMetrics.CPUCores) == 0 {
+			// Adicionar pelo menos um core para evitar null no banco de dados
+			systemMetrics.CPUCores = []CPUCore{{
+				Core:  0,
+				Usage: systemMetrics.CPUUsada,
+			}}
+			metricas.SystemMetrics.CPUCores = systemMetrics.CPUCores
+		}
+		
 		// Serializar para JSON
 		jsonData, err := json.Marshal(metricas)
 		if err != nil {
@@ -1379,7 +1389,7 @@ func coletarEEnviarMetricasProcessos(localIP string) {
 		}
 		
 		// Imprimir JSON para debug (remover em produção)
-		// fmt.Printf("JSON enviado: %s\n", string(jsonData))
+		fmt.Printf("JSON enviado: %s\n", string(jsonData))
 		
 		// Enviar para a API
 		resp, err := http.Post("http://170.205.37.204:8081/process_metrics", 
