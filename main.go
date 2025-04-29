@@ -1379,6 +1379,17 @@ func coletarEEnviarMetricasProcessos(localIP string) {
 				Usage: systemMetrics.CPUUsada,
 			}}
 			metricas.SystemMetrics.CPUCores = systemMetrics.CPUCores
+		} else {
+			// Garantir que os valores de uso estão corretos
+			metricas.SystemMetrics = systemMetrics
+		}
+		
+		// Imprimir detalhes das métricas de CPU antes de enviar
+		fmt.Printf("CPU Total: %.2f, CPU Usada: %.2f, CPU Livre: %.2f\n", 
+			metricas.SystemMetrics.CPUTotal, metricas.SystemMetrics.CPUUsada, metricas.SystemMetrics.CPULivre)
+		fmt.Printf("Cores de CPU (%d cores):\n", len(metricas.SystemMetrics.CPUCores))
+		for _, core := range metricas.SystemMetrics.CPUCores {
+			fmt.Printf("  Core %d: %.2f%%\n", core.Core, core.Usage)
 		}
 		
 		// Serializar para JSON
@@ -1389,7 +1400,7 @@ func coletarEEnviarMetricasProcessos(localIP string) {
 		}
 		
 		// Imprimir JSON para debug (remover em produção)
-		fmt.Printf("JSON enviado: %s\n", string(jsonData))
+		// fmt.Printf("JSON enviado: %s\n", string(jsonData))
 		
 		// Enviar para a API
 		resp, err := http.Post("http://170.205.37.204:8081/process_metrics", 
@@ -1528,7 +1539,14 @@ func coletarMetricasCPU() (SystemMetrics, error) {
 		}
 		
 		// Uso da CPU = 100 - idle
+		// Garantir que o valor está entre 0 e 100
 		usage := 100.0 - idle
+		fmt.Printf("Core %d: idle=%.2f, usage=%.2f\n", coreID, idle, usage)
+		if usage < 0 {
+			usage = 0
+		} else if usage > 100 {
+			usage = 100
+		}
 		
 		if coreID == -1 {
 			// Total de todas as CPUs
