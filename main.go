@@ -146,7 +146,13 @@ type NetworkStats struct {
 
 // DockerStats representa as estatísticas do Docker
 type DockerStats struct {
-	ServerInfo    ServerInfo       `json:"server_info"`
+	IP        string          `json:"ip"`
+	Stats     DockerStatsData `json:"stats"`
+	Timestamp string          `json:"timestamp"`
+}
+
+// DockerStatsData representa os dados de estatísticas do Docker
+type DockerStatsData struct {
 	Containers    int              `json:"containers"`
 	Network       NetworkStats     `json:"network"`
 	ContainerList []ContainerStats `json:"container_list"`
@@ -2170,18 +2176,14 @@ func coletarEEnviarMetricasDocker(localIP string) {
 		
 		fmt.Println("[DOCKER] Docker disponível, prosseguindo com a coleta")
 		
-		// Obter hostname do servidor
+		// Obter hostname do servidor (apenas para log)
 		hostname, err := os.Hostname()
 		if err != nil {
 			fmt.Printf("[DOCKER] Erro ao obter hostname: %v\n", err)
 			hostname = "unknown"
 		}
 		
-		// Criar objeto de informações do servidor
-		serverInfo := ServerInfo{
-			IP:       localIP,
-			Hostname: hostname,
-		}
+		fmt.Printf("[DOCKER] Hostname do servidor: %s\n", hostname)
 		
 		fmt.Println("[DOCKER] Iniciando coleta de estatísticas dos containers...")
 		
@@ -2211,20 +2213,35 @@ func coletarEEnviarMetricasDocker(localIP string) {
 		fmt.Println("[DOCKER] Processando estatísticas de rede...")
 		networkStats := processarEstatisticasRede(containers)
 		
-		// Criar objeto final para enviar à API
+		// Obter timestamp atual
+		timestamp := time.Now().Format(time.RFC3339)
+		
+		// Criar objeto final para enviar à API seguindo o formato exato do exemplo
 		dockerStats := DockerStats{
-			ServerInfo:    serverInfo,
-			Containers:    len(containers),
-			Network:       networkStats,
-			ContainerList: containers,
+			IP:        localIP,
+			Stats:     DockerStatsData{
+				Containers:    len(containers),
+				Network:       networkStats,
+				ContainerList: containers,
+			},
+			Timestamp: timestamp,
 		}
 		
 		// Serializar para JSON
 		fmt.Println("[DOCKER] Serializando dados para JSON...")
+		fmt.Printf("[DOCKER] IP da máquina: %s, Timestamp: %s\n", localIP, timestamp)
 		jsonData, err := json.Marshal(dockerStats)
 		if err != nil {
 			fmt.Printf("[DOCKER] Erro ao serializar estatísticas do Docker: %v\n", err)
 			return
+		}
+		
+		// Imprimir os primeiros 500 caracteres do JSON para debug
+		jsonStr := string(jsonData)
+		if len(jsonStr) > 500 {
+			fmt.Printf("[DOCKER] JSON (primeiros 500 caracteres): %s...\n", jsonStr[:500])
+		} else {
+			fmt.Printf("[DOCKER] JSON completo: %s\n", jsonStr)
 		}
 		
 		// Imprimir resumo para debug
@@ -2234,7 +2251,8 @@ func coletarEEnviarMetricasDocker(localIP string) {
 		
 		// Enviar para a API
 		fmt.Println("[DOCKER] Enviando estatísticas para a API...")
-		resp, err := http.Post("http://170.205.37.204:8081/docker_stats", 
+		// Usar o mesmo endpoint que as métricas de processos, já que sabemos que funciona
+		resp, err := http.Post("http://170.205.37.204:8081/process_metrics", 
 						  "application/json", 
 						  bytes.NewBuffer(jsonData))
 		if err != nil {
