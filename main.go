@@ -2259,6 +2259,10 @@ func coletarEEnviarMetricasDocker(localIP string) {
 		fmt.Printf("[DOCKER] Tráfego de rede total: RX=%s, TX=%s\n", 
 			networkStats.TotalRXFormatted, networkStats.TotalTXFormatted)
 		
+		// Mostrar o JSON final completo que será enviado para a API
+		fmt.Println("[DOCKER] JSON FINAL ENVIADO PARA API:")
+		fmt.Println(string(jsonData))
+		
 		// Enviar para a API
 		fmt.Println("[DOCKER] Enviando estatísticas para a API...")
 		// Usar o mesmo endpoint que as métricas de processos, já que sabemos que funciona
