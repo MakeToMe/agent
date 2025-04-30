@@ -2265,10 +2265,19 @@ func coletarEEnviarMetricasDocker(localIP string) {
 		
 		// Enviar para a API
 		fmt.Println("[DOCKER] Enviando estatísticas para a API...")
-		// Usar o mesmo endpoint que as métricas de processos, já que sabemos que funciona
-		resp, err := http.Post("http://170.205.37.204:8081/process_metrics", 
-						  "application/json", 
-						  bytes.NewBuffer(jsonData))
+		// Criar uma requisição HTTP com o endpoint correto
+		req, err := http.NewRequest("POST", "http://170.205.37.204:8081/docker_stats", bytes.NewBuffer(jsonData))
+		if err != nil {
+			fmt.Printf("[DOCKER] Erro ao criar requisição HTTP: %v\n", err)
+			return
+		}
+		
+		// Definir explicitamente o Content-Type como application/json
+		req.Header.Set("Content-Type", "application/json")
+		
+		// Enviar a requisição
+		client := &http.Client{}
+		resp, err := client.Do(req)
 		if err != nil {
 			fmt.Printf("[DOCKER] Erro ao enviar estatísticas do Docker: %v\n", err)
 			return
