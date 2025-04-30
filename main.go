@@ -1911,27 +1911,20 @@ func sendBannedIPsList(localIP string, failedLogins []LoginFailure) {
 	}
 }
 
-// isWindows verifica se o sistema operacional é Windows
-func isWindows() bool {
-	// Verificar se o sistema operacional é Windows
-	cmd := exec.Command("cmd", "/c", "ver")
-	err := cmd.Run()
-	return err == nil
-}
-
 // dockerEstaDisponivel verifica se o Docker está instalado e em execução
 func dockerEstaDisponivel() bool {
 	// Comando para verificar se o Docker está em execução
-	var cmd *exec.Cmd
-	if isWindows() {
-		cmd = exec.Command("cmd", "/c", "docker info")
-	} else {
-		cmd = exec.Command("sh", "-c", "docker info")
+	cmd := exec.Command("sh", "-c", "docker info")
+	
+	// Executar o comando e capturar a saída para debug
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		fmt.Printf("[DOCKER] Erro ao verificar Docker: %v\n", err)
+		fmt.Printf("[DOCKER] Saída do comando: %s\n", string(output))
+		return false
 	}
 	
-	// Executar o comando
-	err := cmd.Run()
-	return err == nil
+	return true
 }
 
 // converterParaBytes converte valores como "7.28GB" ou "156MB" para bytes
@@ -2072,39 +2065,47 @@ func coletarDockerStats() ([]ContainerStats, error) {
 	}
 	
 	// Executar o comando docker stats para obter estatísticas
-	var cmd *exec.Cmd
-	if isWindows() {
-		cmd = exec.Command("cmd", "/c", "docker stats --no-stream --format \"{{json .}}\"")
-	} else {
-		cmd = exec.Command("sh", "-c", "docker stats --no-stream --format '{{json .}}'")
-	}
+	cmd := exec.Command("sh", "-c", "docker stats --no-stream --format '{{json .}}'")
 	
-	output, err := cmd.Output()
+	// Executar o comando e capturar a saída
+	output, err := cmd.CombinedOutput()
 	if err != nil {
+		fmt.Printf("[DOCKER] Erro ao executar 'docker stats': %v\n", err)
+		fmt.Printf("[DOCKER] Saída do comando: %s\n", string(output))
 		return nil, fmt.Errorf("erro ao executar docker stats: %v", err)
 	}
+	
+	// Imprimir a saída para debug
+	fmt.Printf("[DOCKER] Saída do comando 'docker stats': %s\n", string(output))
 	
 	// Processar a saída linha por linha
 	lines := strings.Split(string(output), "\n")
 	containers := make([]ContainerStats, 0)
 	
-	for _, line := range lines {
+	fmt.Printf("[DOCKER] Processando %d linhas de saída\n", len(lines))
+	
+	for i, line := range lines {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
 		
-		// Remover aspas extras que podem estar causando problemas
-		line = strings.Replace(line, "\"{{json .}}\"", "{{json .}}", -1)
-		line = strings.Replace(line, "'{{json .}}'", "{{json .}}", -1)
+		fmt.Printf("[DOCKER] Processando linha %d: %s\n", i+1, line)
 		
 		// Processar o JSON
 		var container map[string]string
 		err := json.Unmarshal([]byte(line), &container)
 		if err != nil {
-			log.Printf("Erro ao decodificar JSON: %v, linha: %s", err, line)
+			fmt.Printf("[DOCKER] Erro ao decodificar JSON: %v, linha: %s\n", err, line)
 			continue
 		}
+		
+		// Imprimir as chaves encontradas para debug
+		fmt.Printf("[DOCKER] Container JSON decodificado com sucesso. Chaves encontradas: ")
+		for k := range container {
+			fmt.Printf("%s, ", k)
+		}
+		fmt.Println()
 		
 		// Extrair informações básicas do container
 		containerStats := ContainerStats{
