@@ -147,7 +147,7 @@ type NetworkStats struct {
 // DockerStats representa as estatísticas do Docker
 type DockerStats struct {
 	IP        string          `json:"ip"`
-	Stats     DockerStatsData `json:"stats"`
+	Stats     json.RawMessage `json:"stats"`
 	Timestamp string          `json:"timestamp"`
 }
 
@@ -2216,14 +2216,24 @@ func coletarEEnviarMetricasDocker(localIP string) {
 		// Obter timestamp atual
 		timestamp := time.Now().Format(time.RFC3339)
 		
+		// Primeiro, criar e serializar os dados de estatísticas
+		statsData := DockerStatsData{
+			Containers:    len(containers),
+			Network:       networkStats,
+			ContainerList: containers,
+		}
+		
+		// Serializar os dados de estatísticas para JSON
+		statsJSON, err := json.Marshal(statsData)
+		if err != nil {
+			fmt.Printf("[DOCKER] Erro ao serializar dados de estatísticas: %v\n", err)
+			return
+		}
+		
 		// Criar objeto final para enviar à API seguindo o formato exato do exemplo
 		dockerStats := DockerStats{
 			IP:        localIP,
-			Stats:     DockerStatsData{
-				Containers:    len(containers),
-				Network:       networkStats,
-				ContainerList: containers,
-			},
+			Stats:     json.RawMessage(statsJSON),
 			Timestamp: timestamp,
 		}
 		
