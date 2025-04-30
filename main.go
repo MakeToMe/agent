@@ -113,6 +113,45 @@ type DockerWorker struct {
 	IP       string
 }
 
+// ContainerStats representa as estatísticas de um container Docker
+type ContainerStats struct {
+	ID          string  `json:"id"`
+	Name        string  `json:"name"`
+	CPUPerc     string  `json:"cpu_perc"`
+	MemUsage    string  `json:"mem_usage"`
+	MemPerc     string  `json:"mem_perc"`
+	NetIO       string  `json:"net_io"`
+	BlockIO     string  `json:"block_io"`
+	PIDs        string  `json:"pids"`
+	Container   string  `json:"container"`
+	CPUPercent  float64 `json:"cpu_percent"`
+	MemPercent  float64 `json:"mem_percent"`
+	PidsCount   int     `json:"pids_count"`
+	NetIORXBytes int64   `json:"net_io_rx_bytes_raw"`
+	NetIOTXBytes int64   `json:"net_io_tx_bytes_raw"`
+	NetIO_RX_Bytes float64 `json:"net_io_rx_bytes"`
+	NetIO_TX_Bytes float64 `json:"net_io_tx_bytes"`
+	NetIO_RX_Formatted string `json:"net_io_rx_formatted"`
+	NetIO_TX_Formatted string `json:"net_io_tx_formatted"`
+}
+
+// NetworkStats representa as estatísticas de rede agregadas
+type NetworkStats struct {
+	TotalRXBytes     int64  `json:"total_rx_bytes"`
+	TotalTXBytes     int64  `json:"total_tx_bytes"`
+	TotalRXFormatted string `json:"total_rx_formatted"`
+	TotalTXFormatted string `json:"total_tx_formatted"`
+	TotalBandwidth   string `json:"total_bandwidth"`
+}
+
+// DockerStats representa as estatísticas do Docker
+type DockerStats struct {
+	ServerInfo    ServerInfo       `json:"server_info"`
+	Containers    int              `json:"containers"`
+	Network       NetworkStats     `json:"network"`
+	ContainerList []ContainerStats `json:"container_list"`
+}
+
 // Variáveis globais
 var isFirstCycle = true
 var dockerWorkers []DockerWorker
@@ -184,6 +223,9 @@ func main() {
 
 	// Iniciar rotina para coletar e enviar métricas de processos a cada 10 segundos
 	go coletarEEnviarMetricasProcessos(localIP)
+
+	// Iniciar rotina para coletar e enviar métricas do Docker a cada 5 minutos
+	go coletarEEnviarMetricasDocker(localIP)
 
 	// Manter o programa em execução
 	select {}
@@ -1822,53 +1864,385 @@ func coletarMetricasSistema() (SystemMetrics, error) {
 
 // sendBannedIPsList envia a lista de IPs banidos para a API externa
 func sendBannedIPsList(localIP string, failedLogins []LoginFailure) {
-	// Converter falhas de login para o formato esperado pela API
+	// Filtrar apenas IPs com 3 ou mais falhas
 	var bannedIPs []BanIP
 	for _, failure := range failedLogins {
-		// Já filtramos por 3 ou mais falhas no comando shell, mas mantemos a verificação por segurança
 		if failure.Count >= 3 {
 			bannedIPs = append(bannedIPs, BanIP{IP2Ban: failure.IP})
 		}
 	}
-
-	// Se não houver IPs para banir, ainda enviamos uma lista vazia
+	
+	// Se não houver IPs para enviar, não fazer nada
+	if len(bannedIPs) == 0 {
+		fmt.Println("Nenhum IP com 3 ou mais falhas para enviar")
+		return
+	}
+	
+	// Criar objeto para enviar
 	payload := BanList{
 		IP:      localIP,
 		BanList: bannedIPs,
 	}
-
-	// Log para depuração detalhado
-	fmt.Printf("Encontrados %d IPs com 3 ou mais falhas de login\n", len(bannedIPs))
-	fmt.Printf("Enviando %d IPs suspeitos para API (limite configurado: 5000)\n", len(bannedIPs))
-	fmt.Printf("Ciclo: %s\n", map[bool]string{true: "PRIMEIRO - todos os IPs históricos", false: "SUBSEQUENTE - apenas IPs recentes"}[isFirstCycle])
 	
-	// Imprimir os primeiros 5 IPs para depuração
-	fmt.Println("Primeiros IPs da lista (até 5):")
-	for i, ip := range bannedIPs {
-		if i >= 5 {
-			break
-		}
-		fmt.Printf("  - %s\n", ip.IP2Ban)
-	}
-
+	// Serializar para JSON
 	jsonData, err := json.Marshal(payload)
 	if err != nil {
-		log.Printf("Erro ao serializar JSON: %v\n", err)
+		fmt.Printf("Erro ao serializar lista de IPs banidos: %v\n", err)
 		return
 	}
-
-	resp, err := http.Post("http://170.205.37.204:8081/listbanip", "application/json", bytes.NewBuffer(jsonData))
+	
+	// Enviar para a API
+	resp, err := http.Post("http://170.205.37.204:8081/listbanip", 
+					  "application/json", 
+					  bytes.NewBuffer(jsonData))
 	if err != nil {
-		log.Printf("Erro ao enviar lista de IPs banidos: %v\n", err)
+		fmt.Printf("Erro ao enviar lista de IPs banidos: %v\n", err)
 		return
 	}
 	defer resp.Body.Close()
-
+	
+	// Verificar resposta
+	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("Erro ao enviar lista de IPs banidos. Status: %d\n", resp.StatusCode)
-		return
+		fmt.Printf("Erro ao enviar lista de IPs banidos. Status: %d, Resposta: %s\n", 
+			resp.StatusCode, string(respBody))
+	} else {
+		fmt.Printf("Lista de %d IPs banidos enviada com sucesso\n", len(bannedIPs))
 	}
-
-	fmt.Println("Lista de IPs banidos enviada com sucesso!")
 }
 
+// isWindows verifica se o sistema operacional é Windows
+func isWindows() bool {
+	// Verificar se o sistema operacional é Windows
+	cmd := exec.Command("cmd", "/c", "ver")
+	err := cmd.Run()
+	return err == nil
+}
+
+// dockerEstaDisponivel verifica se o Docker está instalado e em execução
+func dockerEstaDisponivel() bool {
+	// Comando para verificar se o Docker está em execução
+	var cmd *exec.Cmd
+	if isWindows() {
+		cmd = exec.Command("cmd", "/c", "docker info")
+	} else {
+		cmd = exec.Command("sh", "-c", "docker info")
+	}
+	
+	// Executar o comando
+	err := cmd.Run()
+	return err == nil
+}
+
+// converterParaBytes converte valores como "7.28GB" ou "156MB" para bytes
+func converterParaBytes(tamanhoStr string) int64 {
+	tamanhoStr = strings.TrimSpace(tamanhoStr)
+	if tamanhoStr == "" || tamanhoStr == "0B" {
+		return 0
+	}
+	
+	// Extrair o valor numérico e a unidade
+	var valor float64
+	var unidade string
+	
+	// Encontrar o índice onde começa a unidade
+	indiceUnidade := -1
+	for i, c := range tamanhoStr {
+		if c < '0' || (c > '9' && c != '.' && c != ',') {
+			indiceUnidade = i
+			break
+		}
+	}
+	
+	if indiceUnidade == -1 {
+		// Sem unidade, assumir bytes
+		valor, _ = strconv.ParseFloat(tamanhoStr, 64)
+		return int64(valor)
+	}
+	
+	// Extrair valor e unidade
+	valorStr := tamanhoStr[:indiceUnidade]
+	// Substituir vírgula por ponto para parsing correto
+	valorStr = strings.Replace(valorStr, ",", ".", -1)
+	valor, _ = strconv.ParseFloat(valorStr, 64)
+	unidade = tamanhoStr[indiceUnidade:]
+	
+	// Converter para bytes baseado na unidade
+	switch strings.ToUpper(unidade) {
+	case "B":
+		return int64(valor)
+	case "KB", "KIB":
+		return int64(valor * 1024)
+	case "MB", "MIB":
+		return int64(valor * 1024 * 1024)
+	case "GB", "GIB":
+		return int64(valor * 1024 * 1024 * 1024)
+	case "TB", "TIB":
+		return int64(valor * 1024 * 1024 * 1024 * 1024)
+	default:
+		// Unidade desconhecida, retornar o valor original
+		return int64(valor)
+	}
+}
+
+// formatarBytes formata bytes para uma representação legível
+func formatarBytes(bytes int64) string {
+	const (
+		_          = iota
+		KB float64 = 1 << (10 * iota)
+		MB
+		GB
+		TB
+	)
+	
+	var valor float64
+	var unidade string
+	
+	switch {
+	case bytes >= int64(TB):
+		valor = float64(bytes) / TB
+		unidade = "TB"
+	case bytes >= int64(GB):
+		valor = float64(bytes) / GB
+		unidade = "GB"
+	case bytes >= int64(MB):
+		valor = float64(bytes) / MB
+		unidade = "MB"
+	case bytes >= int64(KB):
+		valor = float64(bytes) / KB
+		unidade = "KB"
+	default:
+		valor = float64(bytes)
+		unidade = "B"
+	}
+	
+	return fmt.Sprintf("%.2f%s", valor, unidade)
+}
+
+// processarEstatisticasRede processa as estatísticas de rede dos containers
+func processarEstatisticasRede(containers []ContainerStats) NetworkStats {
+	var totalRXBytes, totalTXBytes int64
+	
+	for i := range containers {
+		// Extrair informações de rede (NetIO)
+		if containers[i].NetIO != "" {
+			parts := strings.Split(containers[i].NetIO, "/")
+			if len(parts) == 2 {
+				rxStr := strings.TrimSpace(parts[0])
+				txStr := strings.TrimSpace(parts[1])
+				
+				// Converter para bytes
+				rxBytes := converterParaBytes(rxStr)
+				txBytes := converterParaBytes(txStr)
+				
+				// Armazenar valores no formato antigo
+				containers[i].NetIORXBytes = rxBytes
+				containers[i].NetIOTXBytes = txBytes
+				containers[i].NetIO_RX_Bytes = float64(rxBytes)
+				containers[i].NetIO_TX_Bytes = float64(txBytes)
+				containers[i].NetIO_RX_Formatted = rxStr
+				containers[i].NetIO_TX_Formatted = txStr
+				
+				// Acumular totais
+				totalRXBytes += rxBytes
+				totalTXBytes += txBytes
+			}
+		}
+	}
+	
+	// Formatar os totais para exibição
+	totalRXFormatted := formatarBytes(totalRXBytes)
+	totalTXFormatted := formatarBytes(totalTXBytes)
+	totalBandwidth := formatarBytes(totalRXBytes + totalTXBytes)
+	
+	return NetworkStats{
+		TotalRXBytes:     totalRXBytes,
+		TotalTXBytes:     totalTXBytes,
+		TotalRXFormatted: totalRXFormatted,
+		TotalTXFormatted: totalTXFormatted,
+		TotalBandwidth:   totalBandwidth,
+	}
+}
+
+// coletarDockerStats coleta estatísticas dos containers Docker
+func coletarDockerStats() ([]ContainerStats, error) {
+	// Verificar se o Docker está disponível
+	if !dockerEstaDisponivel() {
+		return nil, fmt.Errorf("Docker não está disponível")
+	}
+	
+	// Executar o comando docker stats para obter estatísticas
+	var cmd *exec.Cmd
+	if isWindows() {
+		cmd = exec.Command("cmd", "/c", "docker stats --no-stream --format \"{{json .}}\"")
+	} else {
+		cmd = exec.Command("sh", "-c", "docker stats --no-stream --format '{{json .}}'")
+	}
+	
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("erro ao executar docker stats: %v", err)
+	}
+	
+	// Processar a saída linha por linha
+	lines := strings.Split(string(output), "\n")
+	containers := make([]ContainerStats, 0)
+	
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		
+		// Remover aspas extras que podem estar causando problemas
+		line = strings.Replace(line, "\"{{json .}}\"", "{{json .}}", -1)
+		line = strings.Replace(line, "'{{json .}}'", "{{json .}}", -1)
+		
+		// Processar o JSON
+		var container map[string]string
+		err := json.Unmarshal([]byte(line), &container)
+		if err != nil {
+			log.Printf("Erro ao decodificar JSON: %v, linha: %s", err, line)
+			continue
+		}
+		
+		// Extrair informações básicas do container
+		containerStats := ContainerStats{
+			ID:        container["ID"],
+			Name:      container["Name"],
+			MemUsage:  container["MemUsage"],
+			NetIO:     container["NetIO"],
+			BlockIO:   container["BlockIO"],
+			Container: container["ID"],  // Campo adicional para compatibilidade
+			CPUPerc:   container["CPUPerc"],
+			MemPerc:   container["MemPerc"],
+			PIDs:      container["PIDs"],
+		}
+		
+		// Processar CPU% (armazenar como float para cálculos internos)
+		if cpuStr, ok := container["CPUPerc"]; ok {
+			cpuStr = strings.TrimSuffix(cpuStr, "%")
+			cpuPercent, err := strconv.ParseFloat(cpuStr, 64)
+			if err == nil {
+				containerStats.CPUPercent = cpuPercent
+			}
+		}
+		
+		// Processar MEM% (armazenar como float para cálculos internos)
+		if memStr, ok := container["MemPerc"]; ok {
+			memStr = strings.TrimSuffix(memStr, "%")
+			memPercent, err := strconv.ParseFloat(memStr, 64)
+			if err == nil {
+				containerStats.MemPercent = memPercent
+			}
+		}
+		
+		// Processar PIDs (armazenar como int para cálculos internos)
+		if pidsStr, ok := container["PIDs"]; ok {
+			pids, err := strconv.Atoi(pidsStr)
+			if err == nil {
+				containerStats.PidsCount = pids
+			}
+		}
+		
+		containers = append(containers, containerStats)
+	}
+	
+	return containers, nil
+}
+
+// coletarEEnviarMetricasDocker coleta e envia métricas do Docker a cada 5 minutos
+func coletarEEnviarMetricasDocker(localIP string) {
+	// Executar a cada 5 minutos
+	ticker := time.NewTicker(5 * time.Minute)
+	
+	// Função para coletar e enviar métricas
+	coletarEEnviar := func() {
+		// Verificar se o Docker está disponível
+		if !dockerEstaDisponivel() {
+			fmt.Println("Docker não está disponível, pulando coleta de métricas")
+			return
+		}
+		
+		// Obter hostname do servidor
+		hostname, err := os.Hostname()
+		if err != nil {
+			fmt.Printf("Erro ao obter hostname: %v\n", err)
+			hostname = "unknown"
+		}
+		
+		// Criar objeto de informações do servidor
+		serverInfo := ServerInfo{
+			IP:       localIP,
+			Hostname: hostname,
+		}
+		
+		fmt.Println("====================================================")
+		fmt.Println("[DOCKER] Iniciando coleta de estatísticas dos containers...")
+		
+		// Coletar estatísticas dos containers
+		containers, err := coletarDockerStats()
+		if err != nil {
+			fmt.Printf("Erro ao coletar estatísticas do Docker: %v\n", err)
+			return
+		}
+		
+		// Se não houver containers, não enviar métricas
+		if len(containers) == 0 {
+			fmt.Println("Nenhum container em execução, pulando envio de métricas")
+			return
+		}
+		
+		// Processar estatísticas de rede
+		networkStats := processarEstatisticasRede(containers)
+		
+		// Criar objeto final para enviar à API
+		dockerStats := DockerStats{
+			ServerInfo:    serverInfo,
+			Containers:    len(containers),
+			Network:       networkStats,
+			ContainerList: containers,
+		}
+		
+		// Serializar para JSON
+		jsonData, err := json.Marshal(dockerStats)
+		if err != nil {
+			fmt.Printf("Erro ao serializar estatísticas do Docker: %v\n", err)
+			return
+		}
+		
+		// Imprimir resumo para debug
+		fmt.Printf("[DOCKER] Coletadas estatísticas de %d containers\n", len(containers))
+		fmt.Printf("[DOCKER] Tráfego de rede total: RX=%s, TX=%s\n", 
+			networkStats.TotalRXFormatted, networkStats.TotalTXFormatted)
+		
+		// Enviar para a API
+		resp, err := http.Post("http://170.205.37.204:8081/docker_stats", 
+						  "application/json", 
+						  bytes.NewBuffer(jsonData))
+		if err != nil {
+			fmt.Printf("Erro ao enviar estatísticas do Docker: %v\n", err)
+			return
+		}
+		defer resp.Body.Close()
+		
+		// Verificar resposta
+		respBody, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusOK {
+			fmt.Printf("Erro ao enviar estatísticas do Docker. Status: %d, Resposta: %s\n", 
+				resp.StatusCode, string(respBody))
+		} else {
+			fmt.Println("Estatísticas do Docker enviadas com sucesso")
+		}
+		
+		// Métricas enviadas com sucesso
+	}
+	
+	// Executar imediatamente na primeira vez
+	coletarEEnviar()
+	
+	// Depois executar a cada tick
+	for range ticker.C {
+		coletarEEnviar()
+	}
+}
