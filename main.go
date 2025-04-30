@@ -2158,16 +2158,21 @@ func coletarEEnviarMetricasDocker(localIP string) {
 	
 	// Função para coletar e enviar métricas
 	coletarEEnviar := func() {
+		fmt.Println("====================================================")
+		fmt.Println("[DOCKER] Verificando disponibilidade do Docker...")
+		
 		// Verificar se o Docker está disponível
 		if !dockerEstaDisponivel() {
-			fmt.Println("Docker não está disponível, pulando coleta de métricas")
+			fmt.Println("[DOCKER] Docker não está disponível, pulando coleta de métricas")
 			return
 		}
+		
+		fmt.Println("[DOCKER] Docker disponível, prosseguindo com a coleta")
 		
 		// Obter hostname do servidor
 		hostname, err := os.Hostname()
 		if err != nil {
-			fmt.Printf("Erro ao obter hostname: %v\n", err)
+			fmt.Printf("[DOCKER] Erro ao obter hostname: %v\n", err)
 			hostname = "unknown"
 		}
 		
@@ -2177,23 +2182,32 @@ func coletarEEnviarMetricasDocker(localIP string) {
 			Hostname: hostname,
 		}
 		
-		fmt.Println("====================================================")
 		fmt.Println("[DOCKER] Iniciando coleta de estatísticas dos containers...")
 		
 		// Coletar estatísticas dos containers
 		containers, err := coletarDockerStats()
 		if err != nil {
-			fmt.Printf("Erro ao coletar estatísticas do Docker: %v\n", err)
+			fmt.Printf("[DOCKER] Erro ao coletar estatísticas do Docker: %v\n", err)
 			return
 		}
 		
 		// Se não houver containers, não enviar métricas
 		if len(containers) == 0 {
-			fmt.Println("Nenhum container em execução, pulando envio de métricas")
+			fmt.Println("[DOCKER] Nenhum container em execução, pulando envio de métricas")
 			return
 		}
 		
+		fmt.Printf("[DOCKER] Encontrados %d containers em execução\n", len(containers))
+		
+		// Listar os containers encontrados
+		fmt.Println("[DOCKER] Lista de containers:")
+		for i, container := range containers {
+			fmt.Printf("[DOCKER]   %d. %s (CPU: %s, MEM: %s)\n", 
+				i+1, container.Name, container.CPUPerc, container.MemPerc)
+		}
+		
 		// Processar estatísticas de rede
+		fmt.Println("[DOCKER] Processando estatísticas de rede...")
 		networkStats := processarEstatisticasRede(containers)
 		
 		// Criar objeto final para enviar à API
@@ -2205,9 +2219,10 @@ func coletarEEnviarMetricasDocker(localIP string) {
 		}
 		
 		// Serializar para JSON
+		fmt.Println("[DOCKER] Serializando dados para JSON...")
 		jsonData, err := json.Marshal(dockerStats)
 		if err != nil {
-			fmt.Printf("Erro ao serializar estatísticas do Docker: %v\n", err)
+			fmt.Printf("[DOCKER] Erro ao serializar estatísticas do Docker: %v\n", err)
 			return
 		}
 		
@@ -2217,11 +2232,12 @@ func coletarEEnviarMetricasDocker(localIP string) {
 			networkStats.TotalRXFormatted, networkStats.TotalTXFormatted)
 		
 		// Enviar para a API
+		fmt.Println("[DOCKER] Enviando estatísticas para a API...")
 		resp, err := http.Post("http://170.205.37.204:8081/docker_stats", 
 						  "application/json", 
 						  bytes.NewBuffer(jsonData))
 		if err != nil {
-			fmt.Printf("Erro ao enviar estatísticas do Docker: %v\n", err)
+			fmt.Printf("[DOCKER] Erro ao enviar estatísticas do Docker: %v\n", err)
 			return
 		}
 		defer resp.Body.Close()
@@ -2229,19 +2245,22 @@ func coletarEEnviarMetricasDocker(localIP string) {
 		// Verificar resposta
 		respBody, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode != http.StatusOK {
-			fmt.Printf("Erro ao enviar estatísticas do Docker. Status: %d, Resposta: %s\n", 
+			fmt.Printf("[DOCKER] Erro ao enviar estatísticas do Docker. Status: %d, Resposta: %s\n", 
 				resp.StatusCode, string(respBody))
 		} else {
-			fmt.Println("Estatísticas do Docker enviadas com sucesso")
+			fmt.Println("[DOCKER] Estatísticas do Docker enviadas com sucesso")
 		}
 		
-		// Métricas enviadas com sucesso
+		fmt.Println("[DOCKER] Ciclo de coleta e envio concluído")
+		fmt.Println("====================================================")
 	}
 	
 	// Executar imediatamente na primeira vez
+	fmt.Println("[DOCKER] Iniciando primeira coleta de métricas Docker...")
 	coletarEEnviar()
 	
 	// Depois executar a cada tick
+	fmt.Println("[DOCKER] Agendando coletas periódicas a cada 5 minutos")
 	for range ticker.C {
 		coletarEEnviar()
 	}
