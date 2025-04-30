@@ -2158,10 +2158,10 @@ func coletarDockerStats() ([]ContainerStats, error) {
 	return containers, nil
 }
 
-// coletarEEnviarMetricasDocker coleta e envia métricas do Docker a cada 5 minutos
+// coletarEEnviarMetricasDocker coleta e envia métricas do Docker a cada 10 segundos
 func coletarEEnviarMetricasDocker(localIP string) {
-	// Executar a cada 5 minutos
-	ticker := time.NewTicker(5 * time.Minute)
+	// Executar a cada 10 segundos
+	ticker := time.NewTicker(10 * time.Second)
 	
 	// Função para coletar e enviar métricas
 	coletarEEnviar := func() {
@@ -2302,7 +2302,7 @@ func coletarEEnviarMetricasDocker(localIP string) {
 	coletarEEnviar()
 	
 	// Depois executar a cada tick
-	fmt.Println("[DOCKER] Agendando coletas periódicas a cada 5 minutos")
+	fmt.Println("[DOCKER] Agendando coletas periódicas a cada 10 segundos")
 	for range ticker.C {
 		coletarEEnviar()
 	}
