@@ -14,7 +14,22 @@ echo "Iniciando instalação do MTM Agent..."
 # Instalar dependências
 echo "Instalando dependências..."
 apt-get update
-apt-get install -y git ipset wget
+apt-get install -y git ipset wget sysstat
+
+# Verificar se o sysstat foi instalado corretamente
+if ! command -v mpstat &> /dev/null; then
+    echo "ERRO: O comando mpstat não está disponível mesmo após a instalação do sysstat."
+    echo "Tentando instalar novamente..."
+    apt-get install -y --reinstall sysstat
+    
+    if ! command -v mpstat &> /dev/null; then
+        echo "AVISO: Não foi possível instalar o mpstat. O agente usará o método alternativo para coletar métricas de CPU."
+    else
+        echo "mpstat instalado com sucesso!"
+    fi
+else
+    echo "mpstat verificado e disponível!"
+fi
 
 # Remover versão antiga do Go para evitar conflitos
 echo "Removendo versões antigas do Go..."
@@ -120,6 +135,68 @@ fi
 # Verificar status do serviço
 echo "Verificando status do serviço..."
 systemctl status mtm-agent.service
+
+# Coletar e enviar informações do sistema para a API
+echo "Coletando informações do sistema..."
+
+# Obter o IP da VM
+IP_VM=$(hostname -I | awk '{print $1}')
+if [ -z "$IP_VM" ]; then
+    IP_VM="127.0.0.1"
+    echo "Não foi possível obter o IP da VM, usando localhost como fallback."
+fi
+echo "IP detectado: $IP_VM"
+
+# Obter número de cores da CPU
+CPU_CORES=$(grep -c ^processor /proc/cpuinfo)
+echo "Número de cores CPU: $CPU_CORES"
+
+# Obter quantidade total de RAM em GB
+RAM_TOTAL=$(free -m | awk '/^Mem:/{print $2}')
+RAM_GB=$(awk "BEGIN {printf \"%.1f\", $RAM_TOTAL/1024}")
+echo "Memória RAM total: $RAM_GB GB"
+
+# Obter espaço total em disco em GB
+DISK_TOTAL=$(df -BG / | awk 'NR==2 {print $2}' | sed 's/G//')
+echo "Espaço em disco total: $DISK_TOTAL GB"
+
+# Obter informações do sistema operacional
+if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    OS_NAME="$NAME $VERSION_ID"
+else
+    OS_NAME="Linux $(uname -r)"
+fi
+echo "Sistema operacional: $OS_NAME"
+
+# Criar JSON com as informações
+JSON_DATA="{\
+  \"ip\": \"$IP_VM\",\
+  \"cpu\": $CPU_CORES,\
+  \"ram\": $RAM_GB,\
+  \"storage\": $DISK_TOTAL,\
+  \"sistema\": \"$OS_NAME\"\
+}"
+
+# Salvar JSON em arquivo temporário
+echo "$JSON_DATA" > /tmp/system_config.json
+echo "JSON de configuração criado:"
+cat /tmp/system_config.json
+
+# Enviar dados para a API
+echo "Enviando informações do sistema para a API..."
+API_RESPONSE=$(curl -s -X POST -H "Content-Type: application/json" -d @/tmp/system_config.json http://170.205.37.204:8081/config)
+API_STATUS=$?
+
+if [ $API_STATUS -eq 0 ]; then
+    echo "Informações do sistema enviadas com sucesso!"
+    echo "Resposta da API: $API_RESPONSE"
+else
+    echo "Erro ao enviar informações do sistema para a API. Código: $API_STATUS"
+fi
+
+# Remover arquivo temporário
+rm -f /tmp/system_config.json
 
 echo "Instalação concluída com sucesso!"
 echo "O MTM Agent está rodando como um serviço e será iniciado automaticamente na inicialização do sistema."

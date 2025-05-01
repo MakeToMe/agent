@@ -113,6 +113,14 @@ type DockerWorker struct {
 	IP       string
 }
 
+// DockerManager representa um nó manager do Docker Swarm
+type DockerManager struct {
+	NodeID   string
+	IP       string
+	Port     string
+	FullAddr string
+}
+
 // ContainerStats representa as estatísticas de um container Docker
 type ContainerStats struct {
 	ID          string  `json:"id"`
@@ -333,6 +341,85 @@ func verificarDockerSwarm() (bool, error) {
 	return true, nil
 }
 
+// verificarDockerSwarmWorker verifica se a VM é um Worker do Docker Swarm e obtém os IPs dos Managers
+func verificarDockerSwarmWorker() (bool, []DockerManager, error) {
+	// Lista de Managers
+	var managers []DockerManager
+
+	// Verificar se o Docker está instalado
+	cmdDocker := exec.Command("bash", "-c", "command -v docker")
+	_, err := cmdDocker.CombinedOutput()
+	if err != nil {
+		fmt.Println("Docker não encontrado na VM")
+		return false, managers, nil
+	}
+
+	// Verificar se o Swarm está ativo
+	cmdSwarm := exec.Command("bash", "-c", "docker info | grep -q 'Swarm: active' && echo 'active' || echo 'inactive'")
+	outputSwarm, _ := cmdSwarm.CombinedOutput()
+	if strings.TrimSpace(string(outputSwarm)) != "active" {
+		fmt.Println("Docker Swarm não está ativo nesta VM")
+		return false, managers, nil
+	}
+
+	// Tentar executar docker node ls para verificar se é um Manager
+	// Se falhar, provavelmente é um Worker
+	cmdNodeLs := exec.Command("bash", "-c", "docker node ls 2>/dev/null")
+	_, err = cmdNodeLs.CombinedOutput()
+	if err == nil {
+		// Se conseguir executar docker node ls, é um Manager, não um Worker
+		fmt.Println("Esta VM é um Manager do Docker Swarm, não um Worker")
+		return false, managers, nil
+	}
+
+	// É um Worker, obter IPs dos Managers usando docker info
+	fmt.Println("Esta VM é um Worker do Docker Swarm. Obtendo IPs dos Managers...")
+	cmdManagers := exec.Command("bash", "-c", "docker info --format '{{json .Swarm.RemoteManagers}}'")
+	outputManagers, err := cmdManagers.CombinedOutput()
+	if err != nil {
+		fmt.Printf("Erro ao obter IPs dos Managers: %v\n", err)
+		return true, managers, err
+	}
+
+	// Processar o JSON para extrair os IPs dos Managers
+	var remoteManagers []struct {
+		NodeID string `json:"NodeID"`
+		Addr   string `json:"Addr"`
+	}
+
+	err = json.Unmarshal(outputManagers, &remoteManagers)
+	if err != nil {
+		fmt.Printf("Erro ao processar JSON dos Managers: %v\n", err)
+		return true, managers, err
+	}
+
+	// Extrair os IPs e portas dos Managers
+	for _, manager := range remoteManagers {
+		parts := strings.Split(manager.Addr, ":")
+		if len(parts) == 2 {
+			ip := parts[0]
+			port := parts[1]
+			managers = append(managers, DockerManager{
+				NodeID:   manager.NodeID,
+				IP:       ip,
+				Port:     port,
+				FullAddr: manager.Addr,
+			})
+			fmt.Printf("Manager encontrado: NodeID=%s, IP=%s, Porta=%s\n", manager.NodeID, ip, port)
+		} else {
+			fmt.Printf("Formato inesperado para endereço do Manager: %s\n", manager.Addr)
+		}
+	}
+
+	if len(managers) > 0 {
+		fmt.Printf("Encontrados %d Managers do Docker Swarm\n", len(managers))
+		return true, managers, nil
+	}
+
+	fmt.Println("Nenhum Manager encontrado, mas esta VM parece ser um Worker")
+	return true, managers, nil
+}
+
 // configurarFirewall configura o firewall com as regras necessárias
 func configurarFirewall(localIP string) error {
 	// Detectar tipo de firewall
@@ -474,9 +561,50 @@ func configurarFirewall(localIP string) error {
 			enviarRegrasFirewallPadrao(localIP)
 		}
 	} else {
-		// Não é um Manager, enviar regras padrão
-		fmt.Println("VM não é um Manager do Docker Swarm. Enviando regras padrão...")
-		enviarRegrasFirewallPadrao(localIP)
+		// Verificar se é um Worker do Docker Swarm
+		isWorker, managers, err := verificarDockerSwarmWorker()
+		if err != nil {
+			fmt.Printf("Erro ao verificar Docker Swarm Worker: %v\n", err)
+			// Continuar mesmo com erro
+		} else if isWorker && len(managers) > 0 {
+			// Se for um Worker e tiver Managers, liberar acesso deles
+			fmt.Println("VM é um Worker do Docker Swarm. Configurando regras de firewall para Managers...")
+			
+			for _, manager := range managers {
+				// Liberar todo o tráfego dos Managers
+				switch firewallType {
+				case "ufw":
+					exec.Command("bash", "-c", fmt.Sprintf("ufw allow from %s comment 'Docker Swarm Manager: %s'", manager.IP, manager.NodeID)).Run()
+				case "firewalld":
+					exec.Command("bash", "-c", fmt.Sprintf("firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=%s accept'", manager.IP)).Run()
+					exec.Command("bash", "-c", "firewall-cmd --reload").Run()
+				case "iptables":
+					exec.Command("bash", "-c", fmt.Sprintf("iptables -A INPUT -s %s -j ACCEPT", manager.IP)).Run()
+				}
+				
+				// Enviar regra para a API
+				rule := FirewallRule{
+					IP:          localIP,
+					Port:        0, // 0 significa todas as portas
+					Protocol:    "all",
+					Action:      "allow",
+					Description: fmt.Sprintf("Docker Swarm Manager: %s", manager.NodeID),
+					Source:      manager.IP,
+					Active:      true,
+					Priority:    10,
+					FirewallType: firewallType,
+				}
+				
+				enviarRegraFirewall(rule)
+			}
+			
+			// Enviar também as regras padrão
+			enviarRegrasFirewallPadrao(localIP)
+		} else {
+			// Não é um Manager nem um Worker, enviar regras padrão
+			fmt.Println("VM não é um nó do Docker Swarm. Enviando regras padrão...")
+			enviarRegrasFirewallPadrao(localIP)
+		}
 	}
 
 	// Banir IPs maliciosos
