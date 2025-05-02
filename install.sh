@@ -3,6 +3,31 @@
 # Script de instalação do MTM Agent
 # Este script deve ser executado como root
 
+# Função para atualizar o status da instalação
+update_installation_status() {
+    local status=$1
+    local ip=$2
+    
+    echo "Atualizando status da instalação para: $status (IP: $ip)"
+    
+    # Criar JSON com o status e IP
+    local json_data="{\
+      \"papel\": \"$status\",\
+      \"ip\": \"$ip\"\
+    }"
+    
+    # Enviar para a API
+    local api_response=$(curl -s -X POST -H "Content-Type: application/json" -d "$json_data" http://170.205.37.204:8081/config)
+    local api_status=$?
+    
+    if [ $api_status -eq 0 ]; then
+        echo "Status atualizado com sucesso!"
+        echo "Resposta da API: $api_response"
+    else
+        echo "Erro ao atualizar status. Código: $api_status"
+    fi
+}
+
 # Verificar se está sendo executado como root
 if [ "$(id -u)" != "0" ]; then
    echo "Este script deve ser executado como root" 1>&2
@@ -10,6 +35,17 @@ if [ "$(id -u)" != "0" ]; then
 fi
 
 echo "Iniciando instalação do MTM Agent..."
+
+# Obter o IP da VM (antecipado para usar nas atualizações de status)
+IP_VM=$(hostname -I | awk '{print $1}')
+if [ -z "$IP_VM" ]; then
+    IP_VM="127.0.0.1"
+    echo "Não foi possível obter o IP da VM, usando localhost como fallback."
+fi
+echo "IP detectado: $IP_VM"
+
+# Atualizar status: login (conexão estabelecida)
+update_installation_status "login" "$IP_VM"
 
 # Instalar dependências
 echo "Instalando dependências..."
@@ -136,16 +172,11 @@ fi
 echo "Verificando status do serviço..."
 systemctl status mtm-agent.service
 
+# Atualizar status: agente (agente instalado e serviço em execução)
+update_installation_status "agente" "$IP_VM"
+
 # Coletar e enviar informações do sistema para a API
 echo "Coletando informações do sistema..."
-
-# Obter o IP da VM
-IP_VM=$(hostname -I | awk '{print $1}')
-if [ -z "$IP_VM" ]; then
-    IP_VM="127.0.0.1"
-    echo "Não foi possível obter o IP da VM, usando localhost como fallback."
-fi
-echo "IP detectado: $IP_VM"
 
 # Obter número de cores da CPU
 CPU_CORES=$(grep -c ^processor /proc/cpuinfo)
@@ -183,6 +214,9 @@ echo "$JSON_DATA" > /tmp/system_config.json
 echo "JSON de configuração criado:"
 cat /tmp/system_config.json
 
+# Atualizar status: identificado (informações do sistema coletadas)
+update_installation_status "identificado" "$IP_VM"
+
 # Enviar dados para a API
 echo "Enviando informações do sistema para a API..."
 API_RESPONSE=$(curl -s -X POST -H "Content-Type: application/json" -d @/tmp/system_config.json http://170.205.37.204:8081/config)
@@ -197,6 +231,54 @@ fi
 
 # Remover arquivo temporário
 rm -f /tmp/system_config.json
+
+# Determinar o tipo de servidor (Manager, Worker ou Servidor Web)
+echo "Determinando o tipo de servidor..."
+SERVER_TYPE="Servidor Web" # Valor padrão
+
+# Verificar se o Docker está instalado
+if command -v docker &> /dev/null; then
+    # Verificar se o Swarm está ativo
+    if docker info | grep -q "Swarm: active"; then
+        # Verificar se é Manager ou Worker
+        if docker info | grep -q "Is Manager: true"; then
+            SERVER_TYPE="Manager"
+            echo "Servidor identificado como Manager do Swarm"
+        else
+            SERVER_TYPE="Worker"
+            echo "Servidor identificado como Worker do Swarm"
+        fi
+    else
+        echo "Docker instalado, mas Swarm não está ativo. Identificado como Servidor Web."
+    fi
+else
+    echo "Docker não encontrado. Identificado como Servidor Web."
+fi
+
+# Atualizar status final com o tipo de servidor
+echo "Atualizando status final: $SERVER_TYPE"
+
+# Criar JSON final com todas as informações e tipo de servidor
+FINAL_JSON_DATA="{\
+  \"ip\": \"$IP_VM\",\
+  \"cpu\": $CPU_CORES,\
+  \"ram\": $RAM_GB,\
+  \"storage\": $DISK_TOTAL,\
+  \"sistema\": \"$OS_NAME\",\
+  \"papel\": \"$SERVER_TYPE\"\
+}"
+
+# Enviar JSON final para a API
+echo "Enviando configuração final para a API..."
+FINAL_API_RESPONSE=$(curl -s -X POST -H "Content-Type: application/json" -d "$FINAL_JSON_DATA" http://170.205.37.204:8081/config)
+FINAL_API_STATUS=$?
+
+if [ $FINAL_API_STATUS -eq 0 ]; then
+    echo "Configuração final enviada com sucesso!"
+    echo "Resposta da API: $FINAL_API_RESPONSE"
+else
+    echo "Erro ao enviar configuração final para a API. Código: $FINAL_API_STATUS"
+fi
 
 echo "Instalação concluída com sucesso!"
 echo "O MTM Agent está rodando como um serviço e será iniciado automaticamente na inicialização do sistema."
