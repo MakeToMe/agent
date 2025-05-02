@@ -187,8 +187,8 @@ RAM_TOTAL=$(free -m | awk '/^Mem:/{print $2}')
 RAM_GB=$(awk "BEGIN {printf \"%.1f\", $RAM_TOTAL/1024}")
 echo "Memória RAM total: $RAM_GB GB"
 
-# Obter espaço total em disco em GB
-DISK_TOTAL=$(df -BG / | awk 'NR==2 {print $2}' | sed 's/G//')
+# Obter espaço total em disco em GB (soma de todas as partições relevantes)
+DISK_TOTAL=$(df -BG | grep -v "tmpfs\|devtmpfs\|overlay" | awk '{sum += $2} END {print sum}' | sed 's/G//')
 echo "Espaço em disco total: $DISK_TOTAL GB"
 
 # Obter informações do sistema operacional
